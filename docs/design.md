@@ -13,7 +13,7 @@ A conversation is JSON text: `[{"role":"system","text":..},{"role":"user","text"
 `transport` is native HTTPS (cancho's `http-client` and `tls`), taken from cancho-code. It takes the host and the address as arguments: resolving, and which hosts are allowed, is the caller's policy (an agent that must make no external call refuses any address that is not private). Keys are read by the caller and live only in a header line.
 
 ## 5. Checked
-Pure tests by hand-written expected JSON for every adapter case (a conversation with a tool turn, several tool results in one turn, a nested argument that must be written out again, a cut answer, an error body, garbage) and for every decision. **Live**, opt-in: Claude Haiku 5.5 and Mistral Small each answered a question and ran a tool (an `add` the model asked for twice-nested in a loop: step 1 the call, step 2 the answer).
+Pure tests by hand-written expected JSON for every adapter case (a conversation with a tool turn, several tool results in one turn, a nested argument that must be written out again, a cut answer, an error body, garbage) and for every decision. **Live**, opt-in: Claude Haiku 5.5 and Mistral Small each answered a question and ran a tool (an `add` tool the model called in step 1 and used in its step 2 answer).
 
 ## 6. Not built yet
 * **Protocols.** MCP client (use any MCP server's tools), A2A (an agent card, tasks over JSON-RPC and server-sent events), AG-UI (the event stream a front end reads from an agent) and A2UI (declarative UI messages an agent sends). They are JSON over HTTP, so they fit this library as modules beside the adapters; none is written, and none will be written from memory: each needs its current specification read first.
