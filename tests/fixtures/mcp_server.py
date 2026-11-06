@@ -8,7 +8,7 @@ if mode == "crash":
 if mode == "silent":
     sys.stdin.read(); sys.exit(0)
 TOOLS1 = [{"name": "add", "title": "Add", "description": "Add two integers", "annotations": {"readOnlyHint": True}, "inputSchema": {"type": "object", "properties": {"a": {"type": "integer"}, "b": {"type": "integer"}}, "required": ["a", "b"]}}]
-TOOLS2 = [{"name": "echo", "description": "Say it back", "annotations": {"readOnlyHint": True}, "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}}}, {"name": "fail", "description": "Always fails", "inputSchema": {"type": "object", "additionalProperties": False}}, {"name": "write_thing", "description": "Changes something", "annotations": {"readOnlyHint": False}, "inputSchema": {"type": "object"}}]
+TOOLS2 = [{"name": "echo", "description": "Say it back", "annotations": {"readOnlyHint": True}, "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}}}, {"name": "fail", "description": "Always fails", "inputSchema": {"type": "object", "additionalProperties": False}}, {"name": "write_thing", "description": "Changes something", "annotations": {"readOnlyHint": False}, "inputSchema": {"type": "object"}}, {"name": "look_fail", "description": "Reads, finds nothing", "annotations": {"readOnlyHint": True}, "inputSchema": {"type": "object"}}]
 def out(o): sys.stdout.write(json.dumps(o, separators=(",", ":")) + "\n"); sys.stdout.flush()
 def err(i, code, message): out({"jsonrpc": "2.0", "id": i, "error": {"code": code, "message": message}})
 initialized = False
@@ -43,6 +43,7 @@ for line in sys.stdin:
             open(os.environ["MCP_LOG"], "a").write("call %s\n" % name)
         if name == "add": out({"jsonrpc": "2.0", "id": i, "result": {"resultType": "complete", "content": [{"type": "text", "text": str(a.get("a", 0) + a.get("b", 0))}], "isError": False}})
         elif name == "echo": out({"jsonrpc": "2.0", "id": i, "result": {"resultType": "complete", "content": [{"type": "text", "text": a.get("text", "")}]}})
+        elif name == "look_fail": out({"jsonrpc": "2.0", "id": i, "result": {"resultType": "complete", "content": [{"type": "text", "text": "nothing found"}], "isError": True}})
         elif name == "write_thing": out({"jsonrpc": "2.0", "id": i, "result": {"resultType": "complete", "content": [{"type": "text", "text": "changed"}]}})
         elif name == "fail": out({"jsonrpc": "2.0", "id": i, "result": {"resultType": "complete", "content": [{"type": "text", "text": "it always fails"}], "isError": True}})
         else: err(i, -32602, "Unknown tool: %s" % name)
