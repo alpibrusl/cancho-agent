@@ -51,3 +51,17 @@ fn test_calls_are_read_back[&h](heap: &!h Heap) -> [heap] int {
     buffer.drop(heap, none);
     return 0;
 }
+
+fn test_the_text_of_a_message[&h](heap: &!h Heap) -> [heap] int {
+    let m = msg.assistant_message(heap, "say \"hi\"", "[]");
+    borrow m as &mb in {
+        let t = msg.text_of(heap, buffer.bytes(mb));
+        borrow t as &tb in { test.assert(bytes.equal(buffer.bytes(tb), "say \"hi\"")); }
+        buffer.drop(heap, t);
+    }
+    buffer.drop(heap, m);
+    let t2 = msg.text_of(heap, "nope");
+    borrow t2 as &t2b in { test.assert(buffer.size(t2b) == 0); }
+    buffer.drop(heap, t2);
+    return 0;
+}

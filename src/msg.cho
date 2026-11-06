@@ -250,3 +250,19 @@ pub fn fin_length() -> [] int {
 pub fn fin_other() -> [] int {
     return 3;
 }
+
+// The `text` of a message (an assistant's answer), unescaped; empty if there is none.
+pub fn text_of[&h, &m](heap: &!h Heap, message: &m [byte]) -> [heap] buffer.Buffer {
+    let tape = box_slice(heap, 3 * len(message) + 3, 0);
+    var tape_w = tape;
+    var out = buffer.empty(heap, 16);
+    borrow mut tape_w as &!tw in {
+        let tp = contents(tw);
+        if json.parse(message, tp) >= 0 && json.is_object(tp, 0) {
+            buffer.drop(heap, out);
+            out = string_of(heap, message, tp, json.get(message, tp, 0, "text"));
+        }
+    }
+    unbox_slice(heap, tape_w);
+    return out;
+}
