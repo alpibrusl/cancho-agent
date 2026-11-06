@@ -1,0 +1,58 @@
+import std.buffer;
+import std.bytes;
+import std.test;
+import mock;
+import msg;
+
+fn script() -> [] &static [byte] {
+    return "{\"role\":\"assistant\",\"text\":\"\",\"calls\":[{\"id\":\"c1\",\"name\":\"plan\",\"args\":\"{}\"}]}\n\n{\"role\":\"assistant\",\"text\":\"It is a draft.\"}\nnot a message\n";
+}
+
+fn test_the_script_answers_by_how_many_answers_came_before[&h](heap: &!h Heap) -> [heap] int {
+    var c = msg.empty(heap);
+    c = msg.push(heap, c, msg.text_message(heap, "user", "is it a draft?"));
+    test.assert_eq(mock.assistants(heap, "[]"), 0);
+    borrow c as &cb in {
+        test.assert_eq(mock.assistants(heap, buffer.bytes(cb)), 0);
+        let (ok, m, fin, tokens) = mock.reply(heap, script(), buffer.bytes(cb));
+        test.assert(ok);
+        test.assert_eq(fin, msg.fin_tools());
+        test.assert_eq(tokens, 10);
+        borrow m as &mb in {
+            test.assert_eq(msg.call_count(heap, buffer.bytes(mb)), 1);
+        }
+        buffer.drop(heap, m);
+    }
+    c = msg.push(heap, c, msg.assistant_message(heap, "", "[{\"id\":\"c1\",\"name\":\"plan\",\"args\":\"{}\"}]"));
+    c = msg.push(heap, c, msg.tool_message(heap, "c1", "plan", "{}"));
+    borrow c as &cb2 in {
+        test.assert_eq(mock.assistants(heap, buffer.bytes(cb2)), 1);
+        let (ok2, m2, fin2, t2) = mock.reply(heap, script(), buffer.bytes(cb2));
+        test.assert(ok2);
+        test.assert_eq(fin2, msg.fin_stop());
+        borrow m2 as &m2b in {
+            test.assert(bytes.equal(buffer.bytes(m2b), "{\"role\":\"assistant\",\"text\":\"It is a draft.\"}"));
+        }
+        buffer.drop(heap, m2);
+    }
+    c = msg.push(heap, c, msg.assistant_message(heap, "It is a draft.", "[]"));
+    borrow c as &cb3 in {
+        // the third line is not a message, and then the script has run out
+        let (ok3, m3, fin3, t3) = mock.reply(heap, script(), buffer.bytes(cb3));
+        test.assert(!ok3);
+        test.assert_eq(fin3, msg.fin_other());
+        buffer.drop(heap, m3);
+    }
+    buffer.drop(heap, c);
+    return 0;
+}
+
+fn test_an_empty_script_never_answers[&h](heap: &!h Heap) -> [heap] int {
+    let (ok, m, fin, t) = mock.reply(heap, "", "[]");
+    test.assert(!ok);
+    buffer.drop(heap, m);
+    let (ok2, m2, fin2, t2) = mock.reply(heap, "\n\n", "[]");
+    test.assert(!ok2);
+    buffer.drop(heap, m2);
+    return 0;
+}

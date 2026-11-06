@@ -5,6 +5,7 @@ module model;
 import std.buffer;
 import std.io;
 import anthropic;
+import mock;
 import openai;
 import transport;
 
@@ -17,6 +18,11 @@ pub fn k_openai() -> [] int {
 
 pub fn k_anthropic() -> [] int {
     return 1;
+}
+
+// A scripted model (`mock`): no network, `key` holds the script.
+pub fn k_mock() -> [] int {
+    return 2;
 }
 
 // Why a request did not give an answer.
@@ -36,9 +42,17 @@ pub fn e_unreadable() -> [] int {
     return 3;
 }
 
-// `kind`: `k_*`. `host` is the name (the `Host` header and the certificate's), `ip` where it is, `secure` TLS or plain TCP (a local server). `key` may be empty (a local server needs none).
+// `kind`: `k_*`; for `k_mock` nothing else is used but `key` (the script) and `conv`. `host` is the name (the `Host` header and the certificate's), `ip` where it is, `secure` TLS or plain TCP (a local server). `key` may be empty (a local server needs none).
 // Gives (the answer was read, the assistant message, why it stopped (`msg.fin_*`), tokens used, why not (`e_*`), the HTTP status).
 pub fn ask[&h, &n, &c, &i, &ho, &ip, &mo, &k, &r, &en, &cv, &tl](heap: &!h Heap, net: &n Net(""), clock: &c Clock, io: &!i Io, kind: int, host: &ho [byte], ip: &ip [byte], port: int, secure: bool, model: &mo [byte], key: &k [byte], roots: &r [byte], entropy: &en [byte], max_tokens: int, timeout_ms: int, conv: &cv [byte], tools: &tl [byte]) -> [heap, net_out(""), conn_read, conn_write, poll, clock] (bool, buffer.Buffer, int, int, int, int) {
+    if kind == k_mock() {
+        let (mok, mm, mf, mt) = mock.reply(heap, key, conv);
+        var mwhy = e_none();
+        if !mok {
+            mwhy = e_status();
+        }
+        return (mok, mm, mf, mt, mwhy, 200);
+    }
     var body = buffer.empty(heap, 16);
     var path = "/v1/chat/completions";
     var headers = buffer.empty(heap, 256);
