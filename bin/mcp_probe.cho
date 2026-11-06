@@ -6,7 +6,7 @@ import std.io;
 import mcp;
 import mcp_stdio;
 
-// mcp_probe <server command> <modern|legacy|auto> list
+// mcp_probe <server command> <modern|legacy|auto> list | list-read-only
 // mcp_probe <server command> <modern|legacy|auto> call <tool> [<arguments, JSON>]
 // Talk to an MCP server over stdio from a terminal (cancho-agent, docs/design.md section 6): the tools it offers, or one call. The server command is run by /bin/sh -c, one process per request.
 // The answer is printed; the exit code is 0 for an answer that is not an error, 1 for a tool that failed or a server that did not answer, 2 for a bad command line.
@@ -17,7 +17,7 @@ fn say[&i, &t](io: &!i Io, text: &t [byte]) -> [io_write] int {
 
 fn run[&h, &c, &x, &i, &g](heap: &!h Heap, clock: &c Clock, exec: &x Exec(""), io: &!i Io, args: &g Args) -> [heap, args, clock, poll, exec(""), io_write] int {
     if arg_count(args) < 4 {
-        say(io, "usage: mcp_probe <server command> <modern|legacy|auto> list | call <tool> [<arguments>]\n");
+        say(io, "usage: mcp_probe <server command> <modern|legacy|auto> list | list-read-only | call <tool> [<arguments>]\n");
         return 2;
     }
     var era = mcp.era_auto();
@@ -29,8 +29,12 @@ fn run[&h, &c, &x, &i, &g](heap: &!h Heap, clock: &c Clock, exec: &x Exec(""), i
         say(io, "the era is modern, legacy or auto\n");
         return 2;
     }
-    if bytes.equal(arg(args, 3), "list") {
-        let (code, tools) = mcp_stdio.list_tools(heap, clock, exec, arg(args, 1), era, 20000);
+    var read_only = false;
+    if bytes.equal(arg(args, 3), "list-read-only") {
+        read_only = true;
+    }
+    if bytes.equal(arg(args, 3), "list") || read_only {
+        let (code, tools) = mcp_stdio.list_tools(heap, clock, exec, arg(args, 1), era, read_only, 20000);
         borrow tools as &tb in {
             say(io, buffer.bytes(tb));
         }

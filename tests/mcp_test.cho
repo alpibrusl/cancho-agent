@@ -65,13 +65,13 @@ fn test_an_error_is_said_with_its_code[&h](heap: &!h Heap) -> [heap] int {
 
 fn test_a_page_of_tools_becomes_neutral_tools[&h](heap: &!h Heap) -> [heap] int {
     let line = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"resultType\":\"complete\",\"tools\":[{\"name\":\"get_weather\",\"title\":\"Weather\",\"description\":\"Get the weather\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"location\":{\"type\":\"string\"}},\"required\":[\"location\"]},\"icons\":[]},{\"name\":\"ping\",\"inputSchema\":{\"type\":\"object\",\"additionalProperties\":false}},{\"description\":\"no name\"},{\"name\":\"odd\",\"description\":\"d\",\"inputSchema\":null}],\"nextCursor\":\"p2\",\"ttlMs\":300000}}";
-    let (tools, cursor) = mcp.tools_page(heap, line);
+    let (tools, cursor) = mcp.tools_page(heap, line, false);
     same(heap, tools, "[{\"name\":\"get_weather\",\"description\":\"Get the weather\",\"schema\":\"{\\\"type\\\":\\\"object\\\",\\\"properties\\\":{\\\"location\\\":{\\\"type\\\":\\\"string\\\"}},\\\"required\\\":[\\\"location\\\"]}\"},{\"name\":\"ping\",\"description\":\"\",\"schema\":\"{\\\"type\\\":\\\"object\\\",\\\"additionalProperties\\\":false}\"},{\"name\":\"odd\",\"description\":\"d\",\"schema\":\"{\\\"type\\\":\\\"object\\\"}\"}]");
     same(heap, cursor, "p2");
-    let (t2, c2) = mcp.tools_page(heap, "{\"id\":2,\"result\":{\"tools\":[]}}");
+    let (t2, c2) = mcp.tools_page(heap, "{\"id\":2,\"result\":{\"tools\":[]}}", false);
     same(heap, t2, "[]");
     same(heap, c2, "");
-    let (t3, c3) = mcp.tools_page(heap, "{\"id\":2,\"error\":{\"code\":1,\"message\":\"x\"}}");
+    let (t3, c3) = mcp.tools_page(heap, "{\"id\":2,\"error\":{\"code\":1,\"message\":\"x\"}}", false);
     same(heap, t3, "[]");
     same(heap, c3, "");
     return 0;
@@ -92,5 +92,35 @@ fn test_a_tool_result_is_text_for_the_model[&h](heap: &!h Heap) -> [heap] int {
     texted(heap, "{\"id\":2,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"t\"}],\"structuredContent\":{\"x\":1}}}", false, "t");
     texted(heap, "{\"id\":2,\"result\":{}}", false, "");
     texted(heap, "{\"id\":2,\"error\":{\"code\":-32602,\"message\":\"Unknown tool\"}}", false, "");
+    return 0;
+}
+
+fn test_only_the_tools_that_say_they_only_read_can_be_asked_for[&h](heap: &!h Heap) -> [heap] int {
+    let line = "{\"id\":2,\"result\":{\"tools\":[{\"name\":\"look\",\"description\":\"reads\",\"annotations\":{\"readOnlyHint\":true},\"inputSchema\":{\"type\":\"object\"}},{\"name\":\"change\",\"description\":\"writes\",\"annotations\":{\"readOnlyHint\":false},\"inputSchema\":{\"type\":\"object\"}},{\"name\":\"silent\",\"description\":\"says nothing\",\"inputSchema\":{\"type\":\"object\"}},{\"name\":\"odd\",\"description\":\"x\",\"annotations\":{\"readOnlyHint\":\"true\"},\"inputSchema\":{\"type\":\"object\"}},{\"name\":\"other\",\"description\":\"y\",\"annotations\":{\"destructiveHint\":false},\"inputSchema\":{\"type\":\"object\"}}]}}";
+    let (only, c1) = mcp.tools_page(heap, line, true);
+    same(heap, only, "[{\"name\":\"look\",\"description\":\"reads\",\"schema\":\"{\\\"type\\\":\\\"object\\\"}\"}]");
+    buffer.drop(heap, c1);
+    let (all, c2) = mcp.tools_page(heap, line, false);
+    borrow all as &ab in {
+        test.assert_eq(msg.call_count(heap, "{}"), 0);
+        test.assert(len(buffer.bytes(ab)) > 300);
+    }
+    buffer.drop(heap, all);
+    buffer.drop(heap, c2);
+    return 0;
+}
+
+fn test_arrays_are_joined_and_names_prefixed[&h](heap: &!h Heap) -> [heap] int {
+    same(heap, mcp.join_arrays(heap, "[1,2]", "[3]"), "[1,2,3]");
+    same(heap, mcp.join_arrays(heap, "[]", "[3]"), "[3]");
+    same(heap, mcp.join_arrays(heap, "[1]", "[]"), "[1]");
+    same(heap, mcp.join_arrays(heap, "[]", "[]"), "[]");
+    let tools = "[{\"name\":\"add\",\"description\":\"Add\",\"schema\":\"{}\"},{\"name\":\"x\",\"description\":\"\",\"schema\":\"{\\\"type\\\":\\\"object\\\"}\"}]";
+    same(heap, mcp.prefixed(heap, tools, "mcp1_"), "[{\"name\":\"mcp1_add\",\"description\":\"Add\",\"schema\":\"{}\"},{\"name\":\"mcp1_x\",\"description\":\"\",\"schema\":\"{\\\"type\\\":\\\"object\\\"}\"}]");
+    same(heap, mcp.prefixed(heap, "[]", "p_"), "[]");
+    same(heap, mcp.prefixed(heap, "nope", "p_"), "[]");
+    // a name that would be over 64 bytes is left out
+    let long = "[{\"name\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"description\":\"\",\"schema\":\"{}\"},{\"name\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"description\":\"\",\"schema\":\"{}\"}]";
+    same(heap, mcp.prefixed(heap, long, "mcp1_"), "[{\"name\":\"mcp1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"description\":\"\",\"schema\":\"{}\"}]");
     return 0;
 }

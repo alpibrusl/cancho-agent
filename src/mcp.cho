@@ -208,8 +208,10 @@ pub fn error_text[&h, &l](heap: &!h Heap, line: &l [byte]) -> [heap] buffer.Buff
     return out;
 }
 
-// The tools of a `tools/list` result in the neutral form of `msg` (`[{"name","description","schema"}]`, the schema as a string), and the cursor of the next page (empty if none).
-pub fn tools_page[&h, &l](heap: &!h Heap, line: &l [byte]) -> [heap] (buffer.Buffer, buffer.Buffer) {
+// The tools of a `tools/list` result in the neutral form of `msg` (`[{"name","description","schema"}]`, the schema as a string), and the cursor of the next page (empty if none). With
+// `read_only` only the tools that say `annotations.readOnlyHint: true` are kept: the operator of a server they trust decides to offer what only reads, and a tool that says nothing about it
+// is taken to write (the specification says a client treats annotations as untrusted unless the server is trusted, which is why this is the operator's choice and not the model's).
+pub fn tools_page[&h, &l](heap: &!h Heap, line: &l [byte], read_only: bool) -> [heap] (buffer.Buffer, buffer.Buffer) {
     let tape = box_slice(heap, 3 * len(line) + 3, 0);
     var tape_w = tape;
     var tools = msg.empty(heap);
@@ -224,6 +226,15 @@ pub fn tools_page[&h, &l](heap: &!h Heap, line: &l [byte]) -> [heap] (buffer.Buf
                     var k = 0;
                     while k < json.count(tp, list) {
                         let t = json.at(tp, list, k);
+                        var wanted = true;
+                        if read_only {
+                            wanted = false;
+                            let an = json.get(line, tp, t, "annotations");
+                            if an >= 0 && json.is_object(tp, an) {
+                                let ro = json.get(line, tp, an, "readOnlyHint");
+                                wanted = ro >= 0 && json.is_bool(tp, ro) && json.to_bool(tp, ro);
+                            }
+                        }
                         let name = msg.string_of(heap, line, tp, json.get(line, tp, t, "name"));
                         let desc = msg.string_of(heap, line, tp, json.get(line, tp, t, "description"));
                         var sw = json.writer(heap, 64);
@@ -235,7 +246,7 @@ pub fn tools_page[&h, &l](heap: &!h Heap, line: &l [byte]) -> [heap] (buffer.Buf
                         }
                         let schema = json.finish(sw);
                         borrow name as &nb in {
-                            if len(buffer.bytes(nb)) > 0 {
+                            if wanted && len(buffer.bytes(nb)) > 0 {
                                 borrow desc as &db in {
                                     borrow schema as &sb in {
                                         tools = msg.push(heap, tools, msg.tool_def(heap, buffer.bytes(nb), buffer.bytes(db), buffer.bytes(sb)));
@@ -329,4 +340,57 @@ pub fn call_text[&h, &l](heap: &!h Heap, line: &l [byte]) -> [heap] (bool, buffe
     }
     unbox_slice(heap, tape_w);
     return (is_error, out);
+}
+
+// `a` and `b` are JSON arrays; the array of both.
+pub fn join_arrays[&h, &a, &b](heap: &!h Heap, a: &a [byte], b: &b [byte]) -> [heap] buffer.Buffer {
+    if len(b) <= 2 {
+        return buffer.append(heap, buffer.empty(heap, len(a) + 1), a);
+    }
+    if len(a) <= 2 {
+        return buffer.append(heap, buffer.empty(heap, len(b) + 1), b);
+    }
+    var o = buffer.append(heap, buffer.empty(heap, len(a) + len(b)), a[0..len(a) - 1]);
+    o = buffer.push(heap, o, byte_of(44));
+    return buffer.append(heap, o, b[1..len(b)]);
+}
+
+// The neutral tools with `prefix` in front of every name (`mcp1_` + `add`), so the tools of several servers, and the tools of the program itself, cannot be mistaken for one another,
+// and so that a call can be sent back to the server it belongs to. A name that would be over 64 bytes (what the providers take) is left out.
+pub fn prefixed[&h, &t, &p](heap: &!h Heap, tools: &t [byte], prefix: &p [byte]) -> [heap] buffer.Buffer {
+    let tape = box_slice(heap, 3 * len(tools) + 3, 0);
+    var tape_w = tape;
+    var out = msg.empty(heap);
+    borrow mut tape_w as &!tw in {
+        let tp = contents(tw);
+        if json.parse(tools, tp) >= 0 && json.is_array(tp, 0) {
+            var k = 0;
+            while k < json.count(tp, 0) {
+                let t = json.at(tp, 0, k);
+                let name = msg.string_of(heap, tools, tp, json.get(tools, tp, t, "name"));
+                let desc = msg.string_of(heap, tools, tp, json.get(tools, tp, t, "description"));
+                let schema = msg.string_of(heap, tools, tp, json.get(tools, tp, t, "schema"));
+                var full = buffer.append(heap, buffer.empty(heap, 64), prefix);
+                borrow name as &nb in {
+                    full = buffer.append(heap, full, buffer.bytes(nb));
+                }
+                borrow full as &fb in {
+                    if len(buffer.bytes(fb)) <= 64 {
+                        borrow desc as &db in {
+                            borrow schema as &sb in {
+                                out = msg.push(heap, out, msg.tool_def(heap, buffer.bytes(fb), buffer.bytes(db), buffer.bytes(sb)));
+                            }
+                        }
+                    }
+                }
+                buffer.drop(heap, full);
+                buffer.drop(heap, name);
+                buffer.drop(heap, desc);
+                buffer.drop(heap, schema);
+                k = k + 1;
+            }
+        }
+    }
+    unbox_slice(heap, tape_w);
+    return out;
 }

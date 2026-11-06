@@ -92,21 +92,8 @@ fn request_id(era: int) -> [] int {
     return 1;
 }
 
-// `a` and `b` are JSON arrays; the array of both.
-fn both[&h, &a, &b](heap: &!h Heap, a: &a [byte], b: &b [byte]) -> [heap] buffer.Buffer {
-    if len(b) <= 2 {
-        return buffer.append(heap, buffer.empty(heap, len(a) + 1), a);
-    }
-    if len(a) <= 2 {
-        return buffer.append(heap, buffer.empty(heap, len(b) + 1), b);
-    }
-    var o = buffer.append(heap, buffer.empty(heap, len(a) + len(b)), a[0..len(a) - 1]);
-    o = buffer.push(heap, o, byte_of(44));
-    return buffer.append(heap, o, b[1..len(b)]);
-}
-
-// The tools of the server in the neutral form of `msg`, all pages (at most five). `era` is `mcp.era_*` (or `mcp.era_auto()`, found out first).
-pub fn list_tools[&h, &c, &x, &m](heap: &!h Heap, clock: &c Clock, exec: &x Exec(""), command: &m [byte], era_in: int, timeout_ms: int) -> [heap, clock, poll, exec("")] (int, buffer.Buffer) {
+// The tools of the server in the neutral form of `msg`, all pages (at most five); with `read_only` only the ones that say they only read (`mcp.tools_page`). `era` is `mcp.era_*` (or `mcp.era_auto()`, found out first).
+pub fn list_tools[&h, &c, &x, &m](heap: &!h Heap, clock: &c Clock, exec: &x Exec(""), command: &m [byte], era_in: int, read_only: bool, timeout_ms: int) -> [heap, clock, poll, exec("")] (int, buffer.Buffer) {
     var era = era_in;
     if era == mcp.era_auto() {
         era = detect(heap, clock, exec, command, timeout_ms);
@@ -142,12 +129,12 @@ pub fn list_tools[&h, &c, &x, &m](heap: &!h Heap, clock: &c Clock, exec: &x Exec
                         code = answered_error();
                     } else {
                         borrow line as &lb in {
-                            let (tools, next) = mcp.tools_page(heap, buffer.bytes(lb));
+                            let (tools, next) = mcp.tools_page(heap, buffer.bytes(lb), read_only);
                             var joined = buffer.empty(heap, 1);
                             borrow tools as &tb in {
                                 borrow all as &ab in {
                                     buffer.drop(heap, joined);
-                                    joined = both(heap, buffer.bytes(ab), buffer.bytes(tb));
+                                    joined = mcp.join_arrays(heap, buffer.bytes(ab), buffer.bytes(tb));
                                 }
                             }
                             buffer.drop(heap, all);

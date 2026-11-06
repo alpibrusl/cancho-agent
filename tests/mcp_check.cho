@@ -47,7 +47,7 @@ fn run[&h, &c, &x, &i, &g](heap: &!h Heap, clock: &c Clock, exec: &x Exec(""), i
     var fails = 0;
     if bytes.equal(kind, "crash") {
         fails = fails + mark(io, mcp_stdio.detect(heap, clock, exec, command, 5000) == 0 - 1, "a server that crashes cannot be detected");
-        let (code, tools) = mcp_stdio.list_tools(heap, clock, exec, command, mcp.era_modern(), 5000);
+        let (code, tools) = mcp_stdio.list_tools(heap, clock, exec, command, mcp.era_modern(), false, 5000);
         fails = fails + mark(io, code == mcp_stdio.not_run(), "listing its tools says it was not run");
         buffer.drop(heap, tools);
         let (c2, failed, text) = mcp_stdio.call_tool(heap, clock, exec, command, mcp.era_auto(), "add", "{}", 5000);
@@ -56,7 +56,7 @@ fn run[&h, &c, &x, &i, &g](heap: &!h Heap, clock: &c Clock, exec: &x Exec(""), i
         return fails;
     }
     if bytes.equal(kind, "silent") {
-        let (code, tools) = mcp_stdio.list_tools(heap, clock, exec, command, mcp.era_modern(), 5000);
+        let (code, tools) = mcp_stdio.list_tools(heap, clock, exec, command, mcp.era_modern(), false, 5000);
         fails = fails + mark(io, code == mcp_stdio.no_answer(), "a server that says nothing gives no answer");
         buffer.drop(heap, tools);
         let (c2, failed, text) = mcp_stdio.call_tool(heap, clock, exec, command, mcp.era_legacy(), "add", "{}", 5000);
@@ -69,7 +69,7 @@ fn run[&h, &c, &x, &i, &g](heap: &!h Heap, clock: &c Clock, exec: &x Exec(""), i
         want = mcp.era_legacy();
     }
     fails = fails + mark(io, mcp_stdio.detect(heap, clock, exec, command, 5000) == want, "the era of the server is found out");
-    let (code, tools) = mcp_stdio.list_tools(heap, clock, exec, command, mcp.era_auto(), 5000);
+    let (code, tools) = mcp_stdio.list_tools(heap, clock, exec, command, mcp.era_auto(), false, 5000);
     fails = fails + mark(io, code == mcp_stdio.ok(), "the tools are listed");
     borrow tools as &tb in {
         fails = fails + mark(io, has(buffer.bytes(tb), "\"name\":\"add\""), "the first page is there");
@@ -78,6 +78,12 @@ fn run[&h, &c, &x, &i, &g](heap: &!h Heap, clock: &c Clock, exec: &x Exec(""), i
         fails = fails + mark(io, has(buffer.bytes(tb), "\"schema\":\"{\\\"type\\\":\\\"object\\\",\\\"properties\\\":{\\\"a\\\""), "and the schemas as strings");
     }
     buffer.drop(heap, tools);
+    let (cro, only) = mcp_stdio.list_tools(heap, clock, exec, command, mcp.era_auto(), true, 5000);
+    borrow only as &ob in {
+        fails = fails + mark(io, cro == mcp_stdio.ok() && has(buffer.bytes(ob), "\"name\":\"add\"") && has(buffer.bytes(ob), "\"name\":\"echo\""), "asked for the tools that only read: add and echo, on two pages");
+        fails = fails + mark(io, !has(buffer.bytes(ob), "write_thing") && !has(buffer.bytes(ob), "\"name\":\"fail\""), "and not the one that writes, nor the one that says nothing about it");
+    }
+    buffer.drop(heap, only);
     let (c1, f1, t1) = mcp_stdio.call_tool(heap, clock, exec, command, want, "add", "{\"a\":2,\"b\":3}", 5000);
     borrow t1 as &t1b in { fails = fails + mark(io, c1 == mcp_stdio.ok() && !f1 && bytes.equal(buffer.bytes(t1b), "5"), "add(2, 3) is 5"); }
     buffer.drop(heap, t1);
