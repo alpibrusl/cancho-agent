@@ -6,6 +6,7 @@ A provider-neutral agent library for [cancho](../cancho): a conversation and too
 * `src/openai.cho` — OpenAI-compatible chat completions (llama.cpp's server, Ollama, vLLM, Mistral): a request from a conversation and tools, an answer read back.
 * `src/anthropic.cho` — the Anthropic Messages API (system at the top, a turn's tool results together, `tool_use` blocks).
 * `src/mock.cho` — a scripted model for tests (one assistant message per line, no network), `model.k_mock`.
+* `src/mcp.cho`, `src/shell.cho`, `src/mcp_stdio.cho` — an MCP client over stdio (both eras of the protocol, a process per request); `bin/mcp_probe` lists a server's tools and calls one from a terminal.
 * `src/agent.cho` — what the loop decides after each answer: done, run the tools, too many steps, out of tokens, cut off.
 * `src/transport.cho` — one HTTP POST over TLS or plain TCP (from cancho-code's `provider`), for the caller to carry a request.
 * `bin/live.cho`, `bin/live_tools.cho` — a question, and a tool round trip, against a real model (`scripts/live.sh`, opt-in, not in the normal tests).

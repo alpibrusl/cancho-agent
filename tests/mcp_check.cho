@@ -1,0 +1,129 @@
+edition 9;
+
+import std.buffer;
+import std.bytes;
+import std.io;
+import mcp;
+import mcp_stdio;
+import msg;
+
+// mcp_check <server command> <modern|legacy|silent|crash>: the stdio client against a server, one run per kind of server (tests/mcp_check.sh runs them).
+
+fn say[&i, &t](io: &!i Io, text: &t [byte]) -> [io_write] int {
+    return io.write_all(io, text);
+}
+
+fn mark[&i](io: &!i Io, good: bool, name: &static [byte]) -> [io_write] int {
+    if good {
+        say(io, "ok   ");
+        say(io, name);
+        say(io, "\n");
+        return 0;
+    }
+    say(io, "FAIL ");
+    say(io, name);
+    say(io, "\n");
+    return 1;
+}
+
+fn has[&b](text: &b [byte], needle: &static [byte]) -> [] bool {
+    var i = 0;
+    while i + len(needle) <= len(text) {
+        if bytes.equal(text[i..i + len(needle)], needle) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn run[&h, &c, &x, &i, &g](heap: &!h Heap, clock: &c Clock, exec: &x Exec(""), io: &!i Io, args: &g Args) -> [heap, args, clock, poll, exec(""), io_write] int {
+    if arg_count(args) < 3 {
+        say(io, "usage: mcp_check <server command> <modern|legacy|silent|crash>\n");
+        return 2;
+    }
+    let command = arg(args, 1);
+    let kind = arg(args, 2);
+    var fails = 0;
+    if bytes.equal(kind, "crash") {
+        fails = fails + mark(io, mcp_stdio.detect(heap, clock, exec, command, 5000) == 0 - 1, "a server that crashes cannot be detected");
+        let (code, tools) = mcp_stdio.list_tools(heap, clock, exec, command, mcp.era_modern(), 5000);
+        fails = fails + mark(io, code == mcp_stdio.not_run(), "listing its tools says it was not run");
+        buffer.drop(heap, tools);
+        let (c2, failed, text) = mcp_stdio.call_tool(heap, clock, exec, command, mcp.era_auto(), "add", "{}", 5000);
+        fails = fails + mark(io, c2 == mcp_stdio.not_run() && failed, "calling a tool says the server could not be run");
+        buffer.drop(heap, text);
+        return fails;
+    }
+    if bytes.equal(kind, "silent") {
+        let (code, tools) = mcp_stdio.list_tools(heap, clock, exec, command, mcp.era_modern(), 5000);
+        fails = fails + mark(io, code == mcp_stdio.no_answer(), "a server that says nothing gives no answer");
+        buffer.drop(heap, tools);
+        let (c2, failed, text) = mcp_stdio.call_tool(heap, clock, exec, command, mcp.era_legacy(), "add", "{}", 5000);
+        fails = fails + mark(io, c2 == mcp_stdio.no_answer() && failed, "and a call to it is told so");
+        buffer.drop(heap, text);
+        return fails;
+    }
+    var want = mcp.era_modern();
+    if bytes.equal(kind, "legacy") {
+        want = mcp.era_legacy();
+    }
+    fails = fails + mark(io, mcp_stdio.detect(heap, clock, exec, command, 5000) == want, "the era of the server is found out");
+    let (code, tools) = mcp_stdio.list_tools(heap, clock, exec, command, mcp.era_auto(), 5000);
+    fails = fails + mark(io, code == mcp_stdio.ok(), "the tools are listed");
+    borrow tools as &tb in {
+        fails = fails + mark(io, has(buffer.bytes(tb), "\"name\":\"add\""), "the first page is there");
+        fails = fails + mark(io, has(buffer.bytes(tb), "\"name\":\"echo\"") && has(buffer.bytes(tb), "\"name\":\"fail\""), "and the second, by its cursor");
+        fails = fails + mark(io, has(buffer.bytes(tb), "\"description\":\"Add two integers\""), "with the descriptions");
+        fails = fails + mark(io, has(buffer.bytes(tb), "\"schema\":\"{\\\"type\\\":\\\"object\\\",\\\"properties\\\":{\\\"a\\\""), "and the schemas as strings");
+    }
+    buffer.drop(heap, tools);
+    let (c1, f1, t1) = mcp_stdio.call_tool(heap, clock, exec, command, want, "add", "{\"a\":2,\"b\":3}", 5000);
+    borrow t1 as &t1b in { fails = fails + mark(io, c1 == mcp_stdio.ok() && !f1 && bytes.equal(buffer.bytes(t1b), "5"), "add(2, 3) is 5"); }
+    buffer.drop(heap, t1);
+    let (c2, f2, t2) = mcp_stdio.call_tool(heap, clock, exec, command, mcp.era_auto(), "echo", "{\"text\":\"say \\\"hi\\\" café\"}", 5000);
+    borrow t2 as &t2b in { fails = fails + mark(io, c2 == mcp_stdio.ok() && !f2 && bytes.equal(buffer.bytes(t2b), "say \"hi\" café"), "an argument with a quote and an accent comes back as it went (auto era)"); }
+    buffer.drop(heap, t2);
+    let (c3, f3, t3) = mcp_stdio.call_tool(heap, clock, exec, command, want, "fail", "{}", 5000);
+    borrow t3 as &t3b in { fails = fails + mark(io, c3 == mcp_stdio.ok() && f3 && bytes.equal(buffer.bytes(t3b), "it always fails"), "a tool that fails is a result the model sees, marked as a failure"); }
+    buffer.drop(heap, t3);
+    let (c4, f4, t4) = mcp_stdio.call_tool(heap, clock, exec, command, want, "nosuch", "{}", 5000);
+    borrow t4 as &t4b in { fails = fails + mark(io, c4 == mcp_stdio.answered_error() && f4 && has(buffer.bytes(t4b), "refused the call") && has(buffer.bytes(t4b), "Unknown tool: nosuch"), "an unknown tool is a protocol error, said as one"); }
+    buffer.drop(heap, t4);
+    // the wrong era is told by the server, and nothing is believed that was not answered
+    var other = mcp.era_legacy();
+    if want == mcp.era_legacy() {
+        other = mcp.era_modern();
+    }
+    let (c5, f5, t5) = mcp_stdio.call_tool(heap, clock, exec, command, other, "add", "{\"a\":1,\"b\":1}", 5000);
+    fails = fails + mark(io, c5 != mcp_stdio.ok() && f5, "a call in the wrong era does not succeed");
+    buffer.drop(heap, t5);
+    return fails;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec, tty } = split(world);
+    release(ffi);
+    release(signals);
+    release(tty);
+    release(net);
+    release(fs);
+    var status = 1;
+    borrow mut heap as &!h in {
+        borrow args as &g in {
+            borrow clock as &c in {
+                borrow exec as &x in {
+                    borrow mut io as &!i in {
+                        status = run(h, c, x, i, g);
+                    }
+                }
+            }
+        }
+    }
+    release(heap);
+    release(args);
+    release(clock);
+    release(exec);
+    release(io);
+    return status;
+}

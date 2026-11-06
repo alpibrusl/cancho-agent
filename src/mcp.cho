@@ -1,0 +1,332 @@
+edition 7;
+
+module mcp;
+
+import std.buffer;
+import std.bytes;
+import std.json;
+import msg;
+
+// An MCP client's messages, pure (cancho-agent, docs/design.md section 6): build the JSON-RPC lines a client sends a server over stdio, and read what comes back. No process, no clock:
+// `mcp_stdio` runs a server and carries these.
+//
+// Two eras of the protocol are spoken, because servers in the world are in both. Written from the specification as read on 2026-11-06 (revision 2026-07-28 and the legacy 2025-11-25),
+// by a reader that fetched the pages, not from memory; checked here against a fake server written from the same reading, so **a real server is the real test and none has been tried yet**.
+//   modern (2026-07-28)  there is no handshake: every request carries `_meta` with the protocol version and the client's capabilities; a server answers `server/discover`
+//   legacy (2025-11-25)  `initialize` (protocolVersion, capabilities, clientInfo), the server's answer, then the notification `notifications/initialized`, then requests
+// stdio framing is one JSON message per line, no embedded newline, no headers. Servers write only messages to stdout.
+
+pub fn modern_version() -> [] &static [byte] {
+    return "2026-07-28";
+}
+
+pub fn legacy_version() -> [] &static [byte] {
+    return "2025-11-25";
+}
+
+// The two eras, and "find out".
+pub fn era_modern() -> [] int {
+    return 0;
+}
+
+pub fn era_legacy() -> [] int {
+    return 1;
+}
+
+pub fn era_auto() -> [] int {
+    return 2;
+}
+
+fn put_meta[&h](heap: &!h Heap, w: json.Writer) -> [heap] json.Writer {
+    var o = json.put_key(heap, w, "_meta");
+    o = json.begin_object(heap, o);
+    o = json.put_key(heap, o, "io.modelcontextprotocol/protocolVersion");
+    o = json.put_string(heap, o, modern_version());
+    o = json.put_key(heap, o, "io.modelcontextprotocol/clientInfo");
+    o = json.begin_object(heap, o);
+    o = json.put_key(heap, o, "name");
+    o = json.put_string(heap, o, "cancho-agent");
+    o = json.put_key(heap, o, "version");
+    o = json.put_string(heap, o, "0.1.0");
+    o = json.end_object(heap, o);
+    o = json.put_key(heap, o, "io.modelcontextprotocol/clientCapabilities");
+    o = json.begin_object(heap, o);
+    o = json.end_object(heap, o);
+    return json.end_object(heap, o);
+}
+
+// The start of a request: `{"jsonrpc":"2.0","id":N,"method":"..","params":{` and, in the modern era, the `_meta` that every request carries.
+fn open_request[&h, &m](heap: &!h Heap, id: int, method: &m [byte], modern: bool) -> [heap] json.Writer {
+    var w = json.writer(heap, 256);
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "jsonrpc");
+    w = json.put_string(heap, w, "2.0");
+    w = json.put_key(heap, w, "id");
+    w = json.put_int(heap, w, id);
+    w = json.put_key(heap, w, "method");
+    w = json.put_string(heap, w, method);
+    w = json.put_key(heap, w, "params");
+    w = json.begin_object(heap, w);
+    if modern {
+        w = put_meta(heap, w);
+    }
+    return w;
+}
+
+fn close_request[&h](heap: &!h Heap, w: json.Writer) -> [heap] buffer.Buffer {
+    var o = json.end_object(heap, w);
+    o = json.end_object(heap, o);
+    let b = json.finish(o);
+    return buffer.push(heap, b, byte_of(10));
+}
+
+// `server/discover` (modern): a server that speaks the modern era answers with its versions and capabilities, any other answers an error.
+pub fn discover[&h](heap: &!h Heap, id: int) -> [heap] buffer.Buffer {
+    return close_request(heap, open_request(heap, id, "server/discover", true));
+}
+
+// `initialize` (legacy), and the notification that follows the server's answer.
+pub fn initialize[&h](heap: &!h Heap, id: int) -> [heap] buffer.Buffer {
+    var w = json.writer(heap, 256);
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "jsonrpc");
+    w = json.put_string(heap, w, "2.0");
+    w = json.put_key(heap, w, "id");
+    w = json.put_int(heap, w, id);
+    w = json.put_key(heap, w, "method");
+    w = json.put_string(heap, w, "initialize");
+    w = json.put_key(heap, w, "params");
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "protocolVersion");
+    w = json.put_string(heap, w, legacy_version());
+    w = json.put_key(heap, w, "capabilities");
+    w = json.begin_object(heap, w);
+    w = json.end_object(heap, w);
+    w = json.put_key(heap, w, "clientInfo");
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "name");
+    w = json.put_string(heap, w, "cancho-agent");
+    w = json.put_key(heap, w, "version");
+    w = json.put_string(heap, w, "0.1.0");
+    w = json.end_object(heap, w);
+    w = json.end_object(heap, w);
+    w = json.end_object(heap, w);
+    return buffer.push(heap, json.finish(w), byte_of(10));
+}
+
+pub fn initialized[&h](heap: &!h Heap) -> [heap] buffer.Buffer {
+    return buffer.append(heap, buffer.empty(heap, 64), "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n");
+}
+
+// `tools/list`, from `cursor` (empty for the first page).
+pub fn tools_list[&h, &c](heap: &!h Heap, id: int, modern: bool, cursor: &c [byte]) -> [heap] buffer.Buffer {
+    var w = open_request(heap, id, "tools/list", modern);
+    if len(cursor) > 0 {
+        w = json.put_key(heap, w, "cursor");
+        w = json.put_string(heap, w, cursor);
+    }
+    return close_request(heap, w);
+}
+
+// `tools/call` of `name` with `arguments`, JSON text (an object; empty or not an object is `{}`).
+pub fn tools_call[&h, &n, &a](heap: &!h Heap, id: int, modern: bool, name: &n [byte], arguments: &a [byte]) -> [heap] buffer.Buffer {
+    var w = open_request(heap, id, "tools/call", modern);
+    w = json.put_key(heap, w, "name");
+    w = json.put_string(heap, w, name);
+    w = json.put_key(heap, w, "arguments");
+    if len(arguments) > 1 && int_of(arguments[0]) == 123 {
+        w = json.put_fragment(heap, w, arguments);
+    } else {
+        w = json.put_fragment(heap, w, "{}");
+    }
+    return close_request(heap, w);
+}
+
+// What the server wrote that answers request `id`: (0 nothing yet, 1 a result, 2 an error), and that line. Notifications (no id) and answers to other ids are not it; a line that is not
+// JSON is not anything (a server may not write one, but one that does is ignored, not believed).
+pub fn find_response[&h, &o](heap: &!h Heap, output: &o [byte], id: int) -> [heap] (int, buffer.Buffer) {
+    var kind = 0;
+    var found = buffer.empty(heap, 8);
+    var start = 0;
+    var i = 0;
+    while i <= len(output) {
+        if i == len(output) || int_of(output[i]) == 10 {
+            if i > start && kind == 0 {
+                let line = output[start..i];
+                let tape = box_slice(heap, 3 * len(line) + 3, 0);
+                var tape_w = tape;
+                borrow mut tape_w as &!tw in {
+                    let tp = contents(tw);
+                    if json.parse(line, tp) >= 0 && json.is_object(tp, 0) {
+                        let nid = json.get(line, tp, 0, "id");
+                        if nid >= 0 && json.is_int(tp, nid) && json.to_int(line, tp, nid) == id {
+                            if json.get(line, tp, 0, "result") >= 0 {
+                                kind = 1;
+                            } else if json.get(line, tp, 0, "error") >= 0 {
+                                kind = 2;
+                            }
+                            if kind > 0 {
+                                buffer.drop(heap, found);
+                                found = buffer.append(heap, buffer.empty(heap, len(line) + 1), line);
+                            }
+                        }
+                    }
+                }
+                unbox_slice(heap, tape_w);
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return (kind, found);
+}
+
+// `<code>: <message>` of an error response.
+pub fn error_text[&h, &l](heap: &!h Heap, line: &l [byte]) -> [heap] buffer.Buffer {
+    let tape = box_slice(heap, 3 * len(line) + 3, 0);
+    var tape_w = tape;
+    var out = buffer.empty(heap, 16);
+    borrow mut tape_w as &!tw in {
+        let tp = contents(tw);
+        if json.parse(line, tp) >= 0 && json.is_object(tp, 0) {
+            let e = json.get(line, tp, 0, "error");
+            if e >= 0 && json.is_object(tp, e) {
+                let c = json.get(line, tp, e, "code");
+                if c >= 0 && json.is_int(tp, c) {
+                    out = buffer.append(heap, out, line[tp[3 * c + 1]..tp[3 * c + 2]]);
+                    out = buffer.append(heap, out, ": ");
+                }
+                let m = msg.string_of(heap, line, tp, json.get(line, tp, e, "message"));
+                borrow m as &mb in {
+                    out = buffer.append(heap, out, buffer.bytes(mb));
+                }
+                buffer.drop(heap, m);
+            }
+        }
+    }
+    unbox_slice(heap, tape_w);
+    return out;
+}
+
+// The tools of a `tools/list` result in the neutral form of `msg` (`[{"name","description","schema"}]`, the schema as a string), and the cursor of the next page (empty if none).
+pub fn tools_page[&h, &l](heap: &!h Heap, line: &l [byte]) -> [heap] (buffer.Buffer, buffer.Buffer) {
+    let tape = box_slice(heap, 3 * len(line) + 3, 0);
+    var tape_w = tape;
+    var tools = msg.empty(heap);
+    var cursor = buffer.empty(heap, 8);
+    borrow mut tape_w as &!tw in {
+        let tp = contents(tw);
+        if json.parse(line, tp) >= 0 && json.is_object(tp, 0) {
+            let r = json.get(line, tp, 0, "result");
+            if r >= 0 && json.is_object(tp, r) {
+                let list = json.get(line, tp, r, "tools");
+                if list >= 0 && json.is_array(tp, list) {
+                    var k = 0;
+                    while k < json.count(tp, list) {
+                        let t = json.at(tp, list, k);
+                        let name = msg.string_of(heap, line, tp, json.get(line, tp, t, "name"));
+                        let desc = msg.string_of(heap, line, tp, json.get(line, tp, t, "description"));
+                        var sw = json.writer(heap, 64);
+                        let sch = json.get(line, tp, t, "inputSchema");
+                        if sch >= 0 && json.is_object(tp, sch) {
+                            sw = msg.put_node(heap, sw, line, tp, sch);
+                        } else {
+                            sw = json.put_fragment(heap, sw, "{\"type\":\"object\"}");
+                        }
+                        let schema = json.finish(sw);
+                        borrow name as &nb in {
+                            if len(buffer.bytes(nb)) > 0 {
+                                borrow desc as &db in {
+                                    borrow schema as &sb in {
+                                        tools = msg.push(heap, tools, msg.tool_def(heap, buffer.bytes(nb), buffer.bytes(db), buffer.bytes(sb)));
+                                    }
+                                }
+                            }
+                        }
+                        buffer.drop(heap, name);
+                        buffer.drop(heap, desc);
+                        buffer.drop(heap, schema);
+                        k = k + 1;
+                    }
+                }
+                let nc = json.get(line, tp, r, "nextCursor");
+                if nc >= 0 && json.is_string(tp, nc) {
+                    buffer.drop(heap, cursor);
+                    cursor = msg.string_of(heap, line, tp, nc);
+                }
+            }
+        }
+    }
+    unbox_slice(heap, tape_w);
+    return (tools, cursor);
+}
+
+// The result of a `tools/call` as text for the model: the `text` items joined by newlines, a placeholder (`[image]`, `[audio]`, `[resource <uri>]`) for the others, the
+// `structuredContent` as JSON when there is no text at all. `isError` is the tool's own failure, which the model is meant to see and correct; a protocol error is not a result.
+pub fn call_text[&h, &l](heap: &!h Heap, line: &l [byte]) -> [heap] (bool, buffer.Buffer) {
+    let tape = box_slice(heap, 3 * len(line) + 3, 0);
+    var tape_w = tape;
+    var is_error = false;
+    var out = buffer.empty(heap, 16);
+    var pieces = 0;
+    borrow mut tape_w as &!tw in {
+        let tp = contents(tw);
+        if json.parse(line, tp) >= 0 && json.is_object(tp, 0) {
+            let r = json.get(line, tp, 0, "result");
+            if r >= 0 && json.is_object(tp, r) {
+                let ie = json.get(line, tp, r, "isError");
+                if ie >= 0 && json.is_bool(tp, ie) {
+                    is_error = json.to_bool(tp, ie);
+                }
+                let content = json.get(line, tp, r, "content");
+                if content >= 0 && json.is_array(tp, content) {
+                    var k = 0;
+                    while k < json.count(tp, content) {
+                        let item = json.at(tp, content, k);
+                        let ty = json.get(line, tp, item, "type");
+                        if pieces > 0 {
+                            out = buffer.push(heap, out, byte_of(10));
+                        }
+                        if json.string_equals(line, tp, ty, "text") {
+                            let tx = msg.string_of(heap, line, tp, json.get(line, tp, item, "text"));
+                            borrow tx as &xb in {
+                                out = buffer.append(heap, out, buffer.bytes(xb));
+                            }
+                            buffer.drop(heap, tx);
+                        } else if json.string_equals(line, tp, ty, "image") {
+                            out = buffer.append(heap, out, "[image]");
+                        } else if json.string_equals(line, tp, ty, "audio") {
+                            out = buffer.append(heap, out, "[audio]");
+                        } else if json.string_equals(line, tp, ty, "resource_link") {
+                            let uri = msg.string_of(heap, line, tp, json.get(line, tp, item, "uri"));
+                            out = buffer.append(heap, out, "[resource ");
+                            borrow uri as &ub in {
+                                out = buffer.append(heap, out, buffer.bytes(ub));
+                            }
+                            out = buffer.push(heap, out, byte_of(93));
+                            buffer.drop(heap, uri);
+                        } else {
+                            out = buffer.append(heap, out, "[embedded resource]");
+                        }
+                        pieces = pieces + 1;
+                        k = k + 1;
+                    }
+                }
+                if pieces == 0 {
+                    let sc = json.get(line, tp, r, "structuredContent");
+                    if sc >= 0 {
+                        var w = json.writer(heap, 64);
+                        w = msg.put_node(heap, w, line, tp, sc);
+                        let js = json.finish(w);
+                        borrow js as &jb in {
+                            out = buffer.append(heap, out, buffer.bytes(jb));
+                        }
+                        buffer.drop(heap, js);
+                    }
+                }
+            }
+        }
+    }
+    unbox_slice(heap, tape_w);
+    return (is_error, out);
+}

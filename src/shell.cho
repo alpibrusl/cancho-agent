@@ -1,0 +1,56 @@
+edition 7;
+
+module shell;
+
+import std.buffer;
+import std.process;
+
+// Run a command with input on its standard input and read what it writes to its standard output (cancho-agent, docs/design.md section 6): `/bin/sh -c "<command>"`, the input
+// written once and the output read until the command ends, at most `max_out` bytes and `timeout_ms` milliseconds. Its standard error is not kept. This is how a stdio server is run
+// one request at a time: the server reads its input, answers each message in order and, at the end of its input, exits, as the protocol asks of it. Taken from `ota_assistant`'s model
+// command. The command is the operator's: nothing here builds one from what a model or a user said.
+//
+// Answers (the output, whether the command ended with status 0 within the bounds).
+pub fn run[&h, &c, &x, &m, &p](heap: &!h Heap, clock: &c Clock, exec: &x Exec(""), command: &m [byte], input: &p [byte], max_out: int, timeout_ms: int) -> [heap, clock, poll, exec("")] (buffer.Buffer, bool) {
+    var argv = process.argv(heap, 128);
+    let (a1, c1) = process.add(heap, argv, "-c");
+    let (a2, c2) = process.add(heap, a1, command);
+    argv = a2;
+    var answer = buffer.empty(heap, 1);
+    var good = false;
+    if c1 == 0 && c2 == 0 {
+        match process.channels() {
+            process.Channels::Failed(e) => {
+            }
+            process.Channels::Ok(to_child, child_in, from_child, child_out) => {
+                borrow argv as &av in {
+                    match exec_spawn(exec, "/bin/sh", process.list(av), "PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin\0", Stdio::Pipe(child_in), Stdio::Pipe(child_out), Stdio::Null) {
+                        Spawned::Failed(e) => {
+                            process.close(to_child, from_child);
+                        }
+                        Spawned::Ok(child) => {
+                            let (out, ran) = process.capture(heap, clock, child, to_child, from_child, input, max_out, timeout_ms);
+                            buffer.drop(heap, answer);
+                            answer = out;
+                            match ran {
+                                process.Ran::Code(n) => {
+                                    good = n == 0;
+                                }
+                                process.Ran::Signaled(sg) => {
+                                }
+                                process.Ran::TimedOut => {
+                                }
+                                process.Ran::TooMuch => {
+                                }
+                                process.Ran::Failed(e) => {
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    process.drop(heap, argv);
+    return (answer, good);
+}

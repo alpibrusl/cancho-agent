@@ -1,0 +1,236 @@
+edition 7;
+
+module mcp_stdio;
+
+import std.buffer;
+import std.bytes;
+import mcp;
+import msg;
+import shell;
+
+// An MCP server run over stdio, one request at a time (cancho-agent, docs/design.md section 6). Each call starts the operator's server command, writes the messages of the era (a legacy
+// server first gets `initialize` and `notifications/initialized`; a modern one needs nothing before the request, every request carrying its own version and capabilities), reads the
+// output until the server ends at the end of its input, and picks out the answer. The cost is a process per call, which the modern protocol makes natural (nothing is kept between
+// requests) and which keeps a server that crashes or hangs from taking the agent with it. A server that wants a session is not served by this.
+//
+// Codes: 0 ok, 1 the command could not be run or ended badly, 2 it did not answer, 3 it answered with an error (the text is the error), 4 the answer is not what the call needs.
+
+pub fn ok() -> [] int {
+    return 0;
+}
+
+pub fn not_run() -> [] int {
+    return 1;
+}
+
+pub fn no_answer() -> [] int {
+    return 2;
+}
+
+pub fn answered_error() -> [] int {
+    return 3;
+}
+
+pub fn unreadable() -> [] int {
+    return 4;
+}
+
+fn max_out() -> [] int {
+    return 262144;
+}
+
+fn max_pages() -> [] int {
+    return 5;
+}
+
+// The era of the server: modern if it answers `server/discover` with a result, legacy if it answers anything else (it does not know the method), -1 if it cannot be run.
+pub fn detect[&h, &c, &x, &m](heap: &!h Heap, clock: &c Clock, exec: &x Exec(""), command: &m [byte], timeout_ms: int) -> [heap, clock, poll, exec("")] int {
+    let input = mcp.discover(heap, 1);
+    var era = 0 - 1;
+    borrow input as &ib in {
+        let (out, good) = shell.run(heap, clock, exec, command, buffer.bytes(ib), max_out(), timeout_ms);
+        if good {
+            borrow out as &ob in {
+                let (kind, line) = mcp.find_response(heap, buffer.bytes(ob), 1);
+                if kind == 1 {
+                    era = mcp.era_modern();
+                } else {
+                    era = mcp.era_legacy();
+                }
+                buffer.drop(heap, line);
+            }
+        }
+        buffer.drop(heap, out);
+    }
+    buffer.drop(heap, input);
+    return era;
+}
+
+// The messages that start a request of `era` and the id the answer will have.
+fn preface[&h](heap: &!h Heap, era: int) -> [heap] buffer.Buffer {
+    var b = buffer.empty(heap, 256);
+    if era == mcp.era_legacy() {
+        b = buffer.append(heap, b, "");
+        let i = mcp.initialize(heap, 1);
+        borrow i as &ib in {
+            b = buffer.append(heap, b, buffer.bytes(ib));
+        }
+        buffer.drop(heap, i);
+        let n = mcp.initialized(heap);
+        borrow n as &nb in {
+            b = buffer.append(heap, b, buffer.bytes(nb));
+        }
+        buffer.drop(heap, n);
+    }
+    return b;
+}
+
+fn request_id(era: int) -> [] int {
+    if era == mcp.era_legacy() {
+        return 2;
+    }
+    return 1;
+}
+
+// `a` and `b` are JSON arrays; the array of both.
+fn both[&h, &a, &b](heap: &!h Heap, a: &a [byte], b: &b [byte]) -> [heap] buffer.Buffer {
+    if len(b) <= 2 {
+        return buffer.append(heap, buffer.empty(heap, len(a) + 1), a);
+    }
+    if len(a) <= 2 {
+        return buffer.append(heap, buffer.empty(heap, len(b) + 1), b);
+    }
+    var o = buffer.append(heap, buffer.empty(heap, len(a) + len(b)), a[0..len(a) - 1]);
+    o = buffer.push(heap, o, byte_of(44));
+    return buffer.append(heap, o, b[1..len(b)]);
+}
+
+// The tools of the server in the neutral form of `msg`, all pages (at most five). `era` is `mcp.era_*` (or `mcp.era_auto()`, found out first).
+pub fn list_tools[&h, &c, &x, &m](heap: &!h Heap, clock: &c Clock, exec: &x Exec(""), command: &m [byte], era_in: int, timeout_ms: int) -> [heap, clock, poll, exec("")] (int, buffer.Buffer) {
+    var era = era_in;
+    if era == mcp.era_auto() {
+        era = detect(heap, clock, exec, command, timeout_ms);
+    }
+    if era < 0 {
+        return (not_run(), msg.empty(heap));
+    }
+    var all = msg.empty(heap);
+    var cursor = buffer.empty(heap, 8);
+    var code = ok();
+    var page = 0;
+    var more = true;
+    while more && page < max_pages() {
+        var input = preface(heap, era);
+        borrow cursor as &cb in {
+            let req = mcp.tools_list(heap, request_id(era), era == mcp.era_modern(), buffer.bytes(cb));
+            borrow req as &rb in {
+                input = buffer.append(heap, input, buffer.bytes(rb));
+            }
+            buffer.drop(heap, req);
+        }
+        more = false;
+        borrow input as &ib in {
+            let (out, good) = shell.run(heap, clock, exec, command, buffer.bytes(ib), max_out(), timeout_ms);
+            if !good {
+                code = not_run();
+            } else {
+                borrow out as &ob in {
+                    let (kind, line) = mcp.find_response(heap, buffer.bytes(ob), request_id(era));
+                    if kind == 0 {
+                        code = no_answer();
+                    } else if kind == 2 {
+                        code = answered_error();
+                    } else {
+                        borrow line as &lb in {
+                            let (tools, next) = mcp.tools_page(heap, buffer.bytes(lb));
+                            var joined = buffer.empty(heap, 1);
+                            borrow tools as &tb in {
+                                borrow all as &ab in {
+                                    buffer.drop(heap, joined);
+                                    joined = both(heap, buffer.bytes(ab), buffer.bytes(tb));
+                                }
+                            }
+                            buffer.drop(heap, all);
+                            all = joined;
+                            buffer.drop(heap, tools);
+                            buffer.drop(heap, cursor);
+                            cursor = next;
+                            borrow cursor as &c2 in {
+                                more = len(buffer.bytes(c2)) > 0;
+                            }
+                        }
+                    }
+                    buffer.drop(heap, line);
+                }
+            }
+            buffer.drop(heap, out);
+        }
+        buffer.drop(heap, input);
+        if code != ok() {
+            more = false;
+        }
+        page = page + 1;
+    }
+    buffer.drop(heap, cursor);
+    return (code, all);
+}
+
+// Call tool `name` with `arguments` (JSON text of an object). Answers (code, whether the tool itself failed, the text for the model). The text of a protocol error or of a server that said
+// nothing is a short sentence, so the model is told what happened without a server's own words being taken for the result.
+pub fn call_tool[&h, &c, &x, &m, &n, &a](heap: &!h Heap, clock: &c Clock, exec: &x Exec(""), command: &m [byte], era_in: int, name: &n [byte], arguments: &a [byte], timeout_ms: int) -> [heap, clock, poll, exec("")] (int, bool, buffer.Buffer) {
+    var era = era_in;
+    if era == mcp.era_auto() {
+        era = detect(heap, clock, exec, command, timeout_ms);
+    }
+    if era < 0 {
+        return (not_run(), true, buffer.append(heap, buffer.empty(heap, 40), "The tool server could not be run."));
+    }
+    var input = preface(heap, era);
+    let req = mcp.tools_call(heap, request_id(era), era == mcp.era_modern(), name, arguments);
+    borrow req as &rb in {
+        input = buffer.append(heap, input, buffer.bytes(rb));
+    }
+    buffer.drop(heap, req);
+    var code = ok();
+    var is_error = false;
+    var text = buffer.empty(heap, 16);
+    borrow input as &ib in {
+        let (out, good) = shell.run(heap, clock, exec, command, buffer.bytes(ib), max_out(), timeout_ms);
+        if !good {
+            code = not_run();
+            buffer.drop(heap, text);
+            text = buffer.append(heap, buffer.empty(heap, 40), "The tool server ended badly.");
+        } else {
+            borrow out as &ob in {
+                let (kind, line) = mcp.find_response(heap, buffer.bytes(ob), request_id(era));
+                if kind == 0 {
+                    code = no_answer();
+                    buffer.drop(heap, text);
+                    text = buffer.append(heap, buffer.empty(heap, 40), "The tool server did not answer.");
+                } else if kind == 2 {
+                    code = answered_error();
+                    buffer.drop(heap, text);
+                    text = buffer.append(heap, buffer.empty(heap, 40), "The tool server refused the call: ");
+                    borrow line as &lnb in {
+                        let et = mcp.error_text(heap, buffer.bytes(lnb));
+                        borrow et as &eb in {
+                            text = buffer.append(heap, text, buffer.bytes(eb));
+                        }
+                        buffer.drop(heap, et);
+                    }
+                } else {
+                    borrow line as &lb in {
+                        let (failed, t) = mcp.call_text(heap, buffer.bytes(lb));
+                        is_error = failed;
+                        buffer.drop(heap, text);
+                        text = t;
+                    }
+                }
+                buffer.drop(heap, line);
+            }
+        }
+        buffer.drop(heap, out);
+    }
+    buffer.drop(heap, input);
+    return (code, is_error || code != ok(), text);
+}

@@ -1,0 +1,96 @@
+import std.buffer;
+import std.bytes;
+import std.test;
+import mcp;
+import msg;
+
+fn same[&h](heap: &!h Heap, b: buffer.Buffer, want: &static [byte]) -> [heap] int {
+    borrow b as &bb in {
+        test.assert(bytes.equal(buffer.bytes(bb), want));
+    }
+    buffer.drop(heap, b);
+    return 0;
+}
+
+fn test_the_requests_of_both_eras[&h](heap: &!h Heap) -> [heap] int {
+    same(heap, mcp.discover(heap, 1), "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"server/discover\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\",\"io.modelcontextprotocol/clientInfo\":{\"name\":\"cancho-agent\",\"version\":\"0.1.0\"},\"io.modelcontextprotocol/clientCapabilities\":{}}}}\n");
+    same(heap, mcp.initialize(heap, 1), "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"cancho-agent\",\"version\":\"0.1.0\"}}}\n");
+    same(heap, mcp.initialized(heap), "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n");
+    same(heap, mcp.tools_list(heap, 2, true, ""), "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\",\"io.modelcontextprotocol/clientInfo\":{\"name\":\"cancho-agent\",\"version\":\"0.1.0\"},\"io.modelcontextprotocol/clientCapabilities\":{}}}}\n");
+    same(heap, mcp.tools_list(heap, 2, false, ""), "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}\n");
+    same(heap, mcp.tools_list(heap, 3, false, "x"), "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/list\",\"params\":{\"cursor\":\"x\"}}\n");
+    same(heap, mcp.tools_list(heap, 3, false, "page-2"), "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/list\",\"params\":{\"cursor\":\"page-2\"}}\n");
+    same(heap, mcp.tools_call(heap, 4, false, "add", "{\"a\":1,\"b\":2}"), "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"add\",\"arguments\":{\"a\":1,\"b\":2}}}\n");
+    same(heap, mcp.tools_call(heap, 5, true, "add", ""), "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\",\"io.modelcontextprotocol/clientInfo\":{\"name\":\"cancho-agent\",\"version\":\"0.1.0\"},\"io.modelcontextprotocol/clientCapabilities\":{}},\"name\":\"add\",\"arguments\":{}}}\n");
+    same(heap, mcp.tools_call(heap, 6, false, "x\"y", "not an object"), "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"tools/call\",\"params\":{\"name\":\"x\\\"y\",\"arguments\":{}}}\n");
+    return 0;
+}
+
+fn kind_of[&h](heap: &!h Heap, output: &static [byte], id: int) -> [heap] int {
+    let (k, line) = mcp.find_response(heap, output, id);
+    buffer.drop(heap, line);
+    return k;
+}
+
+fn test_the_answer_to_a_request_is_found_among_what_the_server_writes[&h](heap: &!h Heap) -> [heap] int {
+    let out = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{}}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"x\":1}}\nnot json at all\n{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"resultType\":\"complete\"}}\n{\"jsonrpc\":\"2.0\",\"id\":3,\"error\":{\"code\":-32601,\"message\":\"Method not found\"}}\n";
+    test.assert_eq(kind_of(heap, out, 1), 1);
+    test.assert_eq(kind_of(heap, out, 2), 1);
+    test.assert_eq(kind_of(heap, out, 3), 2);
+    test.assert_eq(kind_of(heap, out, 4), 0);
+    test.assert_eq(kind_of(heap, "", 1), 0);
+    test.assert_eq(kind_of(heap, "{\"id\":1}\n", 1), 0);
+    test.assert_eq(kind_of(heap, "{\"id\":\"1\",\"result\":{}}\n", 1), 0);
+    // the first answer to an id counts
+    let (k, line) = mcp.find_response(heap, "{\"id\":1,\"result\":{\"a\":1}}\n{\"id\":1,\"error\":{\"code\":1,\"message\":\"x\"}}\n", 1);
+    test.assert_eq(k, 1);
+    borrow line as &lb in {
+        test.assert(bytes.equal(buffer.bytes(lb), "{\"id\":1,\"result\":{\"a\":1}}"));
+    }
+    buffer.drop(heap, line);
+    // a last line with no newline is a line
+    test.assert_eq(kind_of(heap, "{\"id\":7,\"result\":{}}", 7), 1);
+    return 0;
+}
+
+fn test_an_error_is_said_with_its_code[&h](heap: &!h Heap) -> [heap] int {
+    let e = mcp.error_text(heap, "{\"jsonrpc\":\"2.0\",\"id\":3,\"error\":{\"code\":-32601,\"message\":\"Method not found\"}}");
+    same(heap, e, "-32601: Method not found");
+    let e2 = mcp.error_text(heap, "{\"id\":3,\"error\":{\"message\":\"no code\"}}");
+    same(heap, e2, "no code");
+    let e3 = mcp.error_text(heap, "{\"id\":3,\"result\":{}}");
+    same(heap, e3, "");
+    return 0;
+}
+
+fn test_a_page_of_tools_becomes_neutral_tools[&h](heap: &!h Heap) -> [heap] int {
+    let line = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"resultType\":\"complete\",\"tools\":[{\"name\":\"get_weather\",\"title\":\"Weather\",\"description\":\"Get the weather\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"location\":{\"type\":\"string\"}},\"required\":[\"location\"]},\"icons\":[]},{\"name\":\"ping\",\"inputSchema\":{\"type\":\"object\",\"additionalProperties\":false}},{\"description\":\"no name\"},{\"name\":\"odd\",\"description\":\"d\",\"inputSchema\":null}],\"nextCursor\":\"p2\",\"ttlMs\":300000}}";
+    let (tools, cursor) = mcp.tools_page(heap, line);
+    same(heap, tools, "[{\"name\":\"get_weather\",\"description\":\"Get the weather\",\"schema\":\"{\\\"type\\\":\\\"object\\\",\\\"properties\\\":{\\\"location\\\":{\\\"type\\\":\\\"string\\\"}},\\\"required\\\":[\\\"location\\\"]}\"},{\"name\":\"ping\",\"description\":\"\",\"schema\":\"{\\\"type\\\":\\\"object\\\",\\\"additionalProperties\\\":false}\"},{\"name\":\"odd\",\"description\":\"d\",\"schema\":\"{\\\"type\\\":\\\"object\\\"}\"}]");
+    same(heap, cursor, "p2");
+    let (t2, c2) = mcp.tools_page(heap, "{\"id\":2,\"result\":{\"tools\":[]}}");
+    same(heap, t2, "[]");
+    same(heap, c2, "");
+    let (t3, c3) = mcp.tools_page(heap, "{\"id\":2,\"error\":{\"code\":1,\"message\":\"x\"}}");
+    same(heap, t3, "[]");
+    same(heap, c3, "");
+    return 0;
+}
+
+fn texted[&h](heap: &!h Heap, line: &static [byte], want_error: bool, want: &static [byte]) -> [heap] int {
+    let (err, text) = mcp.call_text(heap, line);
+    test.assert(err == want_error);
+    same(heap, text, want);
+    return 0;
+}
+
+fn test_a_tool_result_is_text_for_the_model[&h](heap: &!h Heap) -> [heap] int {
+    texted(heap, "{\"id\":2,\"result\":{\"resultType\":\"complete\",\"content\":[{\"type\":\"text\",\"text\":\"Sunny, 22C\"}],\"isError\":false}}", false, "Sunny, 22C");
+    texted(heap, "{\"id\":2,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"one\"},{\"type\":\"image\",\"data\":\"AAAA\",\"mimeType\":\"image/png\"},{\"type\":\"audio\",\"data\":\"BBBB\",\"mimeType\":\"audio/wav\"},{\"type\":\"resource_link\",\"uri\":\"file:///a.txt\",\"name\":\"a\"},{\"type\":\"resource\",\"resource\":{\"uri\":\"x\"}},{\"type\":\"text\",\"text\":\"two \\\"quoted\\\"\"}]}}", false, "one\n[image]\n[audio]\n[resource file:///a.txt]\n[embedded resource]\ntwo \"quoted\"");
+    texted(heap, "{\"id\":2,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"Invalid date: must be in the future\"}],\"isError\":true}}", true, "Invalid date: must be in the future");
+    texted(heap, "{\"id\":2,\"result\":{\"content\":[],\"structuredContent\":{\"temperature\":22.5,\"tags\":[\"a\",true,null]}}}", false, "{\"temperature\":22.5,\"tags\":[\"a\",true,null]}");
+    texted(heap, "{\"id\":2,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"t\"}],\"structuredContent\":{\"x\":1}}}", false, "t");
+    texted(heap, "{\"id\":2,\"result\":{}}", false, "");
+    texted(heap, "{\"id\":2,\"error\":{\"code\":-32602,\"message\":\"Unknown tool\"}}", false, "");
+    return 0;
+}
