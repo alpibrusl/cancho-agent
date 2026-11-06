@@ -1,0 +1,42 @@
+import std.test;
+import policy;
+
+fn test_private_addresses() -> [] int {
+    test.assert(policy.private_ip("127.0.0.1"));
+    test.assert(policy.private_ip("127.9.9.9"));
+    test.assert(policy.private_ip("10.0.0.5"));
+    test.assert(policy.private_ip("10.255.255.255"));
+    test.assert(policy.private_ip("172.16.0.1"));
+    test.assert(policy.private_ip("172.31.255.1"));
+    test.assert(policy.private_ip("192.168.1.20"));
+    test.assert(policy.private_ip("169.254.1.1"));
+    return 0;
+}
+
+fn test_public_and_near_misses() -> [] int {
+    test.assert(!policy.private_ip("8.8.8.8"));
+    test.assert(!policy.private_ip("172.15.0.1"));
+    test.assert(!policy.private_ip("172.32.0.1"));
+    test.assert(!policy.private_ip("192.169.1.1"));
+    test.assert(!policy.private_ip("11.0.0.1"));
+    test.assert(!policy.private_ip("128.0.0.1"));
+    test.assert(!policy.private_ip("169.255.1.1"));
+    test.assert(!policy.private_ip("160.79.104.10"));
+    return 0;
+}
+
+fn test_what_is_not_an_address() -> [] int {
+    test.assert(!policy.private_ip(""));
+    test.assert(!policy.private_ip("localhost"));
+    test.assert(!policy.private_ip("::1"));
+    test.assert(!policy.private_ip("10.0.0"));
+    test.assert(!policy.private_ip("10.0.0.1.1"));
+    test.assert(!policy.private_ip("10.0.0.256"));
+    test.assert(!policy.private_ip("10.0.0."));
+    test.assert(!policy.private_ip(".10.0.0.1"));
+    test.assert(!policy.private_ip("10..0.1"));
+    test.assert(!policy.private_ip("10.0.0.1 "));
+    test.assert(!policy.private_ip("10.0.0.0001"));
+    test.assert(!policy.private_ip("-10.0.0.1"));
+    return 0;
+}

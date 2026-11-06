@@ -1,0 +1,75 @@
+edition 7;
+
+module policy;
+
+import std.bytes;
+
+// Which hosts an agent may talk to (cancho-agent, docs/design.md section 4). A backend that must make no external call refuses any address that is not private: the
+// check is on the address a name resolved to, not on the name, since a name can be made to point anywhere. IPv4 only, as the transport takes an IPv4 literal.
+
+// The four numbers of "a.b.c.d" (each 0 to 255, no sign, no spaces, nothing else), or ok = false.
+fn parts[&t](ip: &t [byte]) -> [] (bool, int, int, int, int) {
+    var v0 = 0;
+    var v1 = 0;
+    var v2 = 0;
+    var v3 = 0;
+    var field = 0;
+    var cur = 0;
+    var digits = 0;
+    var i = 0;
+    while i <= len(ip) {
+        let end = i == len(ip);
+        var c = 46;
+        if !end {
+            c = int_of(ip[i]);
+        }
+        if c == 46 {
+            if digits == 0 || cur > 255 || field > 3 {
+                return (false, 0, 0, 0, 0);
+            }
+            if field == 0 {
+                v0 = cur;
+            } else if field == 1 {
+                v1 = cur;
+            } else if field == 2 {
+                v2 = cur;
+            } else {
+                v3 = cur;
+            }
+            field = field + 1;
+            cur = 0;
+            digits = 0;
+        } else if c >= 48 && c <= 57 {
+            cur = cur * 10 + c - 48;
+            digits = digits + 1;
+            if digits > 3 {
+                return (false, 0, 0, 0, 0);
+            }
+        } else {
+            return (false, 0, 0, 0, 0);
+        }
+        i = i + 1;
+    }
+    if field != 4 {
+        return (false, 0, 0, 0, 0);
+    }
+    return (true, v0, v1, v2, v3);
+}
+
+// Is this address on this machine or on a private network: 127/8, 10/8, 172.16/12, 192.168/16 (and 169.254/16, link-local)? Anything that is not an IPv4 literal is not.
+pub fn private_ip[&t](ip: &t [byte]) -> [] bool {
+    let (ok, a, b, c, d) = parts(ip);
+    if !ok {
+        return false;
+    }
+    if a == 127 || a == 10 {
+        return true;
+    }
+    if a == 172 && b >= 16 && b <= 31 {
+        return true;
+    }
+    if a == 192 && b == 168 {
+        return true;
+    }
+    return a == 169 && b == 254;
+}

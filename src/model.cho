@@ -1,0 +1,110 @@
+edition 7;
+
+module model;
+
+import std.buffer;
+import std.io;
+import anthropic;
+import openai;
+import transport;
+
+// One request to a model, by whichever API it speaks (cancho-agent, docs/design.md section 3): build the request from the neutral conversation and tools, send it,
+// read the answer back into a neutral assistant message. The caller owns the loop and the tools; this is the part of it that touches a network.
+
+pub fn k_openai() -> [] int {
+    return 0;
+}
+
+pub fn k_anthropic() -> [] int {
+    return 1;
+}
+
+// Why a request did not give an answer.
+pub fn e_none() -> [] int {
+    return 0;
+}
+
+pub fn e_transport() -> [] int {
+    return 1;
+}
+
+pub fn e_status() -> [] int {
+    return 2;
+}
+
+pub fn e_unreadable() -> [] int {
+    return 3;
+}
+
+// `kind`: `k_*`. `host` is the name (the `Host` header and the certificate's), `ip` where it is, `secure` TLS or plain TCP (a local server). `key` may be empty (a local server needs none).
+// Gives (the answer was read, the assistant message, why it stopped (`msg.fin_*`), tokens used, why not (`e_*`), the HTTP status).
+pub fn ask[&h, &n, &c, &i, &ho, &ip, &mo, &k, &r, &en, &cv, &tl](heap: &!h Heap, net: &n Net(""), clock: &c Clock, io: &!i Io, kind: int, host: &ho [byte], ip: &ip [byte], port: int, secure: bool, model: &mo [byte], key: &k [byte], roots: &r [byte], entropy: &en [byte], max_tokens: int, timeout_ms: int, conv: &cv [byte], tools: &tl [byte]) -> [heap, net_out(""), conn_read, conn_write, poll, clock] (bool, buffer.Buffer, int, int, int, int) {
+    var body = buffer.empty(heap, 16);
+    var path = "/v1/chat/completions";
+    var headers = buffer.empty(heap, 256);
+    if kind == k_anthropic() {
+        buffer.drop(heap, body);
+        body = anthropic.request(heap, model, max_tokens, conv, tools);
+        path = "/v1/messages";
+        if len(key) > 0 {
+            headers = buffer.append(heap, headers, "x-api-key: ");
+            headers = buffer.append(heap, headers, key);
+            headers = buffer.append(heap, headers, "\r\n");
+        }
+        headers = buffer.append(heap, headers, "anthropic-version: 2023-06-01\r\nContent-Type: application/json\r\n");
+    } else {
+        buffer.drop(heap, body);
+        body = openai.request(heap, model, max_tokens, conv, tools);
+        if len(key) > 0 {
+            headers = buffer.append(heap, headers, "Authorization: Bearer ");
+            headers = buffer.append(heap, headers, key);
+            headers = buffer.append(heap, headers, "\r\n");
+        }
+        headers = buffer.append(heap, headers, "Content-Type: application/json\r\n");
+    }
+    var ok = false;
+    var message = buffer.empty(heap, 8);
+    var fin = 3;
+    var tokens = 0;
+    var why = e_transport();
+    var status = 0;
+    borrow body as &bb in {
+        borrow headers as &hb in {
+            match transport.exchange(heap, net, clock, io, host, port, secure, path, buffer.bytes(hb), buffer.bytes(bb), roots, ip, entropy, 33554432, timeout_ms) {
+                transport.Answered::Ok(st, out) => {
+                    status = st;
+                    why = e_status();
+                    borrow out as &ob in {
+                        if kind == k_anthropic() {
+                            let (o1, m1, f1, a1, b1) = anthropic.reply(heap, buffer.bytes(ob));
+                            ok = o1;
+                            buffer.drop(heap, message);
+                            message = m1;
+                            fin = f1;
+                            tokens = a1 + b1;
+                        } else {
+                            let (o2, m2, f2, a2, b2) = openai.reply(heap, buffer.bytes(ob));
+                            ok = o2;
+                            buffer.drop(heap, message);
+                            message = m2;
+                            fin = f2;
+                            tokens = a2 + b2;
+                        }
+                    }
+                    buffer.drop(heap, out);
+                    if ok {
+                        why = e_none();
+                    } else if st == 200 {
+                        why = e_unreadable();
+                    }
+                }
+                transport.Answered::Failed(tag) => {
+                    status = 0;
+                }
+            }
+        }
+    }
+    buffer.drop(heap, body);
+    buffer.drop(heap, headers);
+    return (ok, message, fin, tokens, why, status);
+}
