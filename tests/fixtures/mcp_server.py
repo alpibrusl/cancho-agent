@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # A fake MCP server over stdio, for tests only: written from the shapes of the specification as read (modern 2026-07-28, legacy 2025-11-25), not from a real server.
 #   mcp_server.py modern|legacy|silent|crash
-import json, sys
+import json, os, sys
 mode = sys.argv[1] if len(sys.argv) > 1 else "modern"
 if mode == "crash":
     sys.stderr.write("crashing on purpose\n"); sys.exit(3)
@@ -39,6 +39,8 @@ for line in sys.stdin:
         else: out({"jsonrpc": "2.0", "id": i, "result": {"resultType": "complete", "tools": TOOLS1, "nextCursor": "p2"}})
     elif method == "tools/call":
         name = params.get("name"); a = params.get("arguments") or {}
+        if os.environ.get("MCP_LOG"):
+            open(os.environ["MCP_LOG"], "a").write("call %s\n" % name)
         if name == "add": out({"jsonrpc": "2.0", "id": i, "result": {"resultType": "complete", "content": [{"type": "text", "text": str(a.get("a", 0) + a.get("b", 0))}], "isError": False}})
         elif name == "echo": out({"jsonrpc": "2.0", "id": i, "result": {"resultType": "complete", "content": [{"type": "text", "text": a.get("text", "")}]}})
         elif name == "write_thing": out({"jsonrpc": "2.0", "id": i, "result": {"resultType": "complete", "content": [{"type": "text", "text": "changed"}]}})
