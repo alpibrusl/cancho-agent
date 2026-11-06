@@ -1,0 +1,45 @@
+edition 7;
+
+module agent;
+
+// The agent loop's decisions, pure (cancho-agent, docs/design.md section 3). The loop itself is I/O (a request, a tool), so it belongs to the caller; what is
+// decided is here, so it is the same for every caller and can be tested without a model. After each answer from the model the caller says how many steps it
+// has taken (this one included), how many tokens it has spent, why the model stopped and how many tools it asked for, and gets one of the answers below.
+
+pub fn d_done() -> [] int {
+    return 0;
+}
+
+pub fn d_run_tools() -> [] int {
+    return 1;
+}
+
+pub fn d_too_many_steps() -> [] int {
+    return 2;
+}
+
+pub fn d_out_of_budget() -> [] int {
+    return 3;
+}
+
+pub fn d_cut_off() -> [] int {
+    return 4;
+}
+
+// `fin` is `msg.fin_*`. The order matters: a budget that is spent stops everything; an answer that was cut off is not an answer; tools are run only if there are
+// steps left to use their results; otherwise it is done.
+pub fn decide(steps: int, max_steps: int, tokens: int, max_tokens: int, fin: int, calls: int) -> [] int {
+    if max_tokens > 0 && tokens >= max_tokens {
+        return d_out_of_budget();
+    }
+    if fin == 2 {
+        return d_cut_off();
+    }
+    if calls > 0 {
+        if steps >= max_steps {
+            return d_too_many_steps();
+        }
+        return d_run_tools();
+    }
+    return d_done();
+}

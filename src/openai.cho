@@ -1,0 +1,194 @@
+edition 7;
+
+module openai;
+
+import std.buffer;
+import std.json;
+import msg;
+
+// The OpenAI-compatible chat completions API (`POST /v1/chat/completions`): what llama.cpp's server, Ollama, vLLM and Mistral all speak. `request` turns a neutral conversation
+// and tool list into its body; `reply` reads its answer back into a neutral assistant message. No transport, no key, no default: those are the caller's.
+
+pub fn request[&h, &m, &c, &t](heap: &!h Heap, model: &m [byte], max_tokens: int, conv: &c [byte], tools: &t [byte]) -> [heap] buffer.Buffer {
+    var w = json.writer(heap, 1024);
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "model");
+    w = json.put_string(heap, w, model);
+    w = json.put_key(heap, w, "max_tokens");
+    w = json.put_int(heap, w, max_tokens);
+    w = json.put_key(heap, w, "messages");
+    w = json.begin_array(heap, w);
+    let tape = box_slice(heap, 3 * len(conv) + 3, 0);
+    var tape_w = tape;
+    borrow mut tape_w as &!tw in {
+        let tp = contents(tw);
+        if json.parse(conv, tp) >= 0 && json.is_array(tp, 0) {
+            var n = 0;
+            while n < json.count(tp, 0) {
+                let m = json.at(tp, 0, n);
+                let role = json.get(conv, tp, m, "role");
+                let text = json.get(conv, tp, m, "text");
+                w = json.begin_object(heap, w);
+                if json.string_equals(conv, tp, role, "tool") {
+                    w = json.put_key(heap, w, "role");
+                    w = json.put_string(heap, w, "tool");
+                    w = json.put_key(heap, w, "tool_call_id");
+                    w = msg.put_text(heap, w, conv, tp, json.get(conv, tp, m, "id"));
+                    w = json.put_key(heap, w, "content");
+                    w = msg.put_text(heap, w, conv, tp, text);
+                } else if json.string_equals(conv, tp, role, "assistant") {
+                    w = json.put_key(heap, w, "role");
+                    w = json.put_string(heap, w, "assistant");
+                    w = json.put_key(heap, w, "content");
+                    if json.string_length(conv, tp, text) > 0 {
+                        w = msg.put_text(heap, w, conv, tp, text);
+                    } else {
+                        w = json.put_null(heap, w);
+                    }
+                    let calls = json.get(conv, tp, m, "calls");
+                    if calls >= 0 && json.is_array(tp, calls) && json.count(tp, calls) > 0 {
+                        w = json.put_key(heap, w, "tool_calls");
+                        w = json.begin_array(heap, w);
+                        var k = 0;
+                        while k < json.count(tp, calls) {
+                            let c = json.at(tp, calls, k);
+                            w = json.begin_object(heap, w);
+                            w = json.put_key(heap, w, "id");
+                            w = msg.put_text(heap, w, conv, tp, json.get(conv, tp, c, "id"));
+                            w = json.put_key(heap, w, "type");
+                            w = json.put_string(heap, w, "function");
+                            w = json.put_key(heap, w, "function");
+                            w = json.begin_object(heap, w);
+                            w = json.put_key(heap, w, "name");
+                            w = msg.put_text(heap, w, conv, tp, json.get(conv, tp, c, "name"));
+                            w = json.put_key(heap, w, "arguments");
+                            w = msg.put_text(heap, w, conv, tp, json.get(conv, tp, c, "args"));
+                            w = json.end_object(heap, w);
+                            w = json.end_object(heap, w);
+                            k = k + 1;
+                        }
+                        w = json.end_array(heap, w);
+                    }
+                } else {
+                    w = json.put_key(heap, w, "role");
+                    w = msg.put_text(heap, w, conv, tp, role);
+                    w = json.put_key(heap, w, "content");
+                    w = msg.put_text(heap, w, conv, tp, text);
+                }
+                w = json.end_object(heap, w);
+                n = n + 1;
+            }
+        }
+    }
+    unbox_slice(heap, tape_w);
+    w = json.end_array(heap, w);
+    if len(tools) > 2 {
+        let ttape = box_slice(heap, 3 * len(tools) + 3, 0);
+        var ttape_w = ttape;
+        borrow mut ttape_w as &!ttw in {
+            let tp = contents(ttw);
+            if json.parse(tools, tp) >= 0 && json.is_array(tp, 0) && json.count(tp, 0) > 0 {
+                w = json.put_key(heap, w, "tools");
+                w = json.begin_array(heap, w);
+                var n = 0;
+                while n < json.count(tp, 0) {
+                    let d = json.at(tp, 0, n);
+                    w = json.begin_object(heap, w);
+                    w = json.put_key(heap, w, "type");
+                    w = json.put_string(heap, w, "function");
+                    w = json.put_key(heap, w, "function");
+                    w = json.begin_object(heap, w);
+                    w = json.put_key(heap, w, "name");
+                    w = msg.put_text(heap, w, tools, tp, json.get(tools, tp, d, "name"));
+                    w = json.put_key(heap, w, "description");
+                    w = msg.put_text(heap, w, tools, tp, json.get(tools, tp, d, "description"));
+                    w = json.put_key(heap, w, "parameters");
+                    w = msg.put_json_text(heap, w, tools, tp, json.get(tools, tp, d, "schema"));
+                    w = json.end_object(heap, w);
+                    w = json.end_object(heap, w);
+                    n = n + 1;
+                }
+                w = json.end_array(heap, w);
+            }
+        }
+        unbox_slice(heap, ttape_w);
+    }
+    w = json.end_object(heap, w);
+    return json.finish(w);
+}
+
+// The answer, read into (ok, a neutral assistant message, why it stopped (`msg.fin_*`), tokens in, tokens out). Not ok when the body is not an answer.
+pub fn reply[&h, &b](heap: &!h Heap, body: &b [byte]) -> [heap] (bool, buffer.Buffer, int, int, int) {
+    let tape = box_slice(heap, 3 * len(body) + 3, 0);
+    var tape_w = tape;
+    var ok = false;
+    var message = buffer.empty(heap, 8);
+    var fin = msg.fin_other();
+    var tin = 0;
+    var tout = 0;
+    borrow mut tape_w as &!tw in {
+        let tp = contents(tw);
+        if json.parse(body, tp) >= 0 && json.is_object(tp, 0) {
+            let choices = json.get(body, tp, 0, "choices");
+            if choices >= 0 && json.is_array(tp, choices) && json.count(tp, choices) > 0 {
+                let first = json.at(tp, choices, 0);
+                let m = json.get(body, tp, first, "message");
+                if m >= 0 && json.is_object(tp, m) {
+                    ok = true;
+                    let content = json.get(body, tp, m, "content");
+                    let text = msg.string_of(heap, body, tp, content);
+                    var cw = json.writer(heap, 64);
+                    cw = json.begin_array(heap, cw);
+                    let tcs = json.get(body, tp, m, "tool_calls");
+                    if tcs >= 0 && json.is_array(tp, tcs) {
+                        var k = 0;
+                        while k < json.count(tp, tcs) {
+                            let c = json.at(tp, tcs, k);
+                            let f = json.get(body, tp, c, "function");
+                            cw = json.begin_object(heap, cw);
+                            cw = json.put_key(heap, cw, "id");
+                            cw = msg.put_text(heap, cw, body, tp, json.get(body, tp, c, "id"));
+                            cw = json.put_key(heap, cw, "name");
+                            cw = msg.put_text(heap, cw, body, tp, json.get(body, tp, f, "name"));
+                            cw = json.put_key(heap, cw, "args");
+                            cw = msg.put_text(heap, cw, body, tp, json.get(body, tp, f, "arguments"));
+                            cw = json.end_object(heap, cw);
+                            k = k + 1;
+                        }
+                    }
+                    cw = json.end_array(heap, cw);
+                    let calls = json.finish(cw);
+                    buffer.drop(heap, message);
+                    borrow text as &xb in {
+                        borrow calls as &cb in {
+                            message = msg.assistant_message(heap, buffer.bytes(xb), buffer.bytes(cb));
+                        }
+                    }
+                    buffer.drop(heap, text);
+                    buffer.drop(heap, calls);
+                    let fr = json.get(body, tp, first, "finish_reason");
+                    if json.string_equals(body, tp, fr, "stop") {
+                        fin = msg.fin_stop();
+                    } else if json.string_equals(body, tp, fr, "tool_calls") {
+                        fin = msg.fin_tools();
+                    } else if json.string_equals(body, tp, fr, "length") {
+                        fin = msg.fin_length();
+                    }
+                }
+            }
+            let u = json.get(body, tp, 0, "usage");
+            if u >= 0 && json.is_object(tp, u) {
+                let pi = json.get(body, tp, u, "prompt_tokens");
+                let po = json.get(body, tp, u, "completion_tokens");
+                if pi >= 0 && json.is_int(tp, pi) {
+                    tin = json.to_int(body, tp, pi);
+                }
+                if po >= 0 && json.is_int(tp, po) {
+                    tout = json.to_int(body, tp, po);
+                }
+            }
+        }
+    }
+    unbox_slice(heap, tape_w);
+    return (ok, message, fin, tin, tout);
+}

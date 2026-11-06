@@ -1,0 +1,252 @@
+edition 7;
+
+module msg;
+
+import std.buffer;
+import std.json;
+
+// The provider-neutral conversation (cancho-agent, docs/design.md section 2). A conversation is a JSON array of messages, kept as text, so it can be stored, logged, replayed and
+// handed to any adapter. A message is one of
+//
+//   {"role":"system","text":".."}                      who the agent is and what it may do
+//   {"role":"user","text":".."}                        someone speaks to it
+//   {"role":"assistant","text":"..","calls":[{"id":"c1","name":"plan","args":"{\"leg\":2}"}]}   the model speaks, and may ask for tools (`calls` is absent when it asks for none; the
+//                                                                                                 arguments of a call are JSON kept as a string, as the providers disagree on how to write them)
+//   {"role":"tool","id":"c1","name":"plan","text":".."}  what a tool answered (by the id of the call), as data
+//
+// Nothing here knows a provider: `openai` and `anthropic` turn this into their own request and read their own reply back into an assistant message.
+
+pub fn empty[&h](heap: &!h Heap) -> [heap] buffer.Buffer {
+    return buffer.append(heap, buffer.empty(heap, 256), "[]");
+}
+
+// `role` is "system" or "user".
+pub fn text_message[&h, &r, &t](heap: &!h Heap, role: &r [byte], text: &t [byte]) -> [heap] buffer.Buffer {
+    var w = json.writer(heap, 128);
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "role");
+    w = json.put_string(heap, w, role);
+    w = json.put_key(heap, w, "text");
+    w = json.put_string(heap, w, text);
+    w = json.end_object(heap, w);
+    return json.finish(w);
+}
+
+// An assistant message; `calls` is a JSON array (`[]` for none), put in as it is.
+pub fn assistant_message[&h, &t, &c](heap: &!h Heap, text: &t [byte], calls: &c [byte]) -> [heap] buffer.Buffer {
+    var w = json.writer(heap, 128);
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "role");
+    w = json.put_string(heap, w, "assistant");
+    w = json.put_key(heap, w, "text");
+    w = json.put_string(heap, w, text);
+    if len(calls) > 2 {
+        w = json.put_key(heap, w, "calls");
+        w = json.put_fragment(heap, w, calls);
+    }
+    w = json.end_object(heap, w);
+    return json.finish(w);
+}
+
+pub fn tool_message[&h, &i, &n, &t](heap: &!h Heap, id: &i [byte], name: &n [byte], text: &t [byte]) -> [heap] buffer.Buffer {
+    var w = json.writer(heap, 128);
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "role");
+    w = json.put_string(heap, w, "tool");
+    w = json.put_key(heap, w, "id");
+    w = json.put_string(heap, w, id);
+    w = json.put_key(heap, w, "name");
+    w = json.put_string(heap, w, name);
+    w = json.put_key(heap, w, "text");
+    w = json.put_string(heap, w, text);
+    w = json.end_object(heap, w);
+    return json.finish(w);
+}
+
+// `conv` with `message` (one JSON object, consumed) added at the end.
+pub fn push[&h](heap: &!h Heap, conv: buffer.Buffer, message: buffer.Buffer) -> [heap] buffer.Buffer {
+    var out = buffer.empty(heap, 64);
+    borrow conv as &cb in {
+        let c = buffer.bytes(cb);
+        if len(c) <= 2 {
+            out = buffer.append(heap, out, "[");
+        } else {
+            out = buffer.append(heap, out, c[0..len(c) - 1]);
+            out = buffer.push(heap, out, byte_of(44));
+        }
+    }
+    buffer.drop(heap, conv);
+    borrow message as &mb in {
+        out = buffer.append(heap, out, buffer.bytes(mb));
+    }
+    buffer.drop(heap, message);
+    return buffer.push(heap, out, byte_of(93));
+}
+
+// The text of a string node, unescaped.
+pub fn string_of[&h, &s, &t](heap: &!h Heap, src: &s [byte], tape: &t [int], node: int) -> [heap] buffer.Buffer {
+    var out = buffer.empty(heap, 16);
+    if node < 0 || !json.is_string(tape, node) {
+        return out;
+    }
+    let size = json.string_length(src, tape, node);
+    if size > 0 {
+        let raw = box_slice(heap, size, byte_of(0));
+        var raw_w = raw;
+        borrow mut raw_w as &!rw in {
+            if json.string_into(src, tape, node, contents(rw)) == size {
+                out = buffer.append(heap, out, contents(rw));
+            }
+        }
+        unbox_slice(heap, raw_w);
+    }
+    return out;
+}
+
+// What a tool call is, read out of an assistant message's `calls`.
+pub fn call_count[&h, &m](heap: &!h Heap, message: &m [byte]) -> [heap] int {
+    let tape = box_slice(heap, 3 * len(message) + 3, 0);
+    var tape_w = tape;
+    var n = 0;
+    borrow mut tape_w as &!tw in {
+        let tp = contents(tw);
+        if json.parse(message, tp) >= 0 && json.is_object(tp, 0) {
+            let calls = json.get(message, tp, 0, "calls");
+            if calls >= 0 && json.is_array(tp, calls) {
+                n = json.count(tp, calls);
+            }
+        }
+    }
+    unbox_slice(heap, tape_w);
+    return n;
+}
+
+// Call `k` of an assistant message: (its id, its name, its arguments as JSON text).
+pub fn call_at[&h, &m](heap: &!h Heap, message: &m [byte], k: int) -> [heap] (buffer.Buffer, buffer.Buffer, buffer.Buffer) {
+    let tape = box_slice(heap, 3 * len(message) + 3, 0);
+    var tape_w = tape;
+    var id = buffer.empty(heap, 8);
+    var name = buffer.empty(heap, 8);
+    var args = buffer.append(heap, buffer.empty(heap, 8), "{}");
+    borrow mut tape_w as &!tw in {
+        let tp = contents(tw);
+        if json.parse(message, tp) >= 0 && json.is_object(tp, 0) {
+            let calls = json.get(message, tp, 0, "calls");
+            if calls >= 0 && json.is_array(tp, calls) && k >= 0 && k < json.count(tp, calls) {
+                let c = json.at(tp, calls, k);
+                buffer.drop(heap, id);
+                id = string_of(heap, message, tp, json.get(message, tp, c, "id"));
+                buffer.drop(heap, name);
+                name = string_of(heap, message, tp, json.get(message, tp, c, "name"));
+                let a = json.get(message, tp, c, "args");
+                if a >= 0 && json.is_string(tp, a) {
+                    buffer.drop(heap, args);
+                    args = string_of(heap, message, tp, a);
+                }
+            }
+        }
+    }
+    unbox_slice(heap, tape_w);
+    return (id, name, args);
+}
+
+// A tool the model may use, in the neutral form: `schema` is JSON text (a JSON Schema object for the arguments), kept as a string like the arguments of a call.
+pub fn tool_def[&h, &n, &d, &s](heap: &!h Heap, name: &n [byte], description: &d [byte], schema: &s [byte]) -> [heap] buffer.Buffer {
+    var w = json.writer(heap, 128);
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "name");
+    w = json.put_string(heap, w, name);
+    w = json.put_key(heap, w, "description");
+    w = json.put_string(heap, w, description);
+    w = json.put_key(heap, w, "schema");
+    w = json.put_string(heap, w, schema);
+    w = json.end_object(heap, w);
+    return json.finish(w);
+}
+
+// The writer with the (unescaped) text of a string node put in as a string.
+pub fn put_text[&h, &s, &t](heap: &!h Heap, w: json.Writer, src: &s [byte], tape: &t [int], node: int) -> [heap] json.Writer {
+    let text = string_of(heap, src, tape, node);
+    var out = w;
+    borrow text as &tb in {
+        out = json.put_string(heap, out, buffer.bytes(tb));
+    }
+    buffer.drop(heap, text);
+    return out;
+}
+
+// The writer with the text of a string node put in as it is, as JSON (a string that holds JSON, such as a call's arguments). Text that is empty is `{}`.
+pub fn put_json_text[&h, &s, &t](heap: &!h Heap, w: json.Writer, src: &s [byte], tape: &t [int], node: int) -> [heap] json.Writer {
+    let text = string_of(heap, src, tape, node);
+    var out = w;
+    borrow text as &tb in {
+        if len(buffer.bytes(tb)) == 0 {
+            out = json.put_fragment(heap, out, "{}");
+        } else {
+            out = json.put_fragment(heap, out, buffer.bytes(tb));
+        }
+    }
+    buffer.drop(heap, text);
+    return out;
+}
+
+// The writer with the whole subtree at `node` written out again (the tape holds no byte range for an object or an array).
+pub fn put_node[&h, &s, &t](heap: &!h Heap, w: json.Writer, src: &s [byte], tape: &t [int], node: int) -> [heap] json.Writer {
+    var out = w;
+    if json.is_object(tape, node) {
+        out = json.begin_object(heap, out);
+        var k = node + 1;
+        var n = 0;
+        let cnt = json.count(tape, node);
+        while n < cnt {
+            let key = string_of(heap, src, tape, k);
+            borrow key as &kb in {
+                out = json.put_key(heap, out, buffer.bytes(kb));
+            }
+            buffer.drop(heap, key);
+            out = put_node(heap, out, src, tape, k + 1);
+            k = json.skip(tape, k + 1);
+            n = n + 1;
+        }
+        return json.end_object(heap, out);
+    }
+    if json.is_array(tape, node) {
+        out = json.begin_array(heap, out);
+        var k = node + 1;
+        var n = 0;
+        let cnt = json.count(tape, node);
+        while n < cnt {
+            out = put_node(heap, out, src, tape, k);
+            k = json.skip(tape, k);
+            n = n + 1;
+        }
+        return json.end_array(heap, out);
+    }
+    if json.is_string(tape, node) {
+        return put_text(heap, out, src, tape, node);
+    }
+    if json.is_number(tape, node) {
+        return json.put_fragment(heap, out, src[tape[3 * node + 1]..tape[3 * node + 2]]);
+    }
+    if json.is_bool(tape, node) {
+        return json.put_bool(heap, out, json.to_bool(tape, node));
+    }
+    return json.put_null(heap, out);
+}
+
+// Why a model stopped: it answered, it asked for tools, it ran out of its token bound, or something else.
+pub fn fin_stop() -> [] int {
+    return 0;
+}
+
+pub fn fin_tools() -> [] int {
+    return 1;
+}
+
+pub fn fin_length() -> [] int {
+    return 2;
+}
+
+pub fn fin_other() -> [] int {
+    return 3;
+}

@@ -1,0 +1,53 @@
+import std.buffer;
+import std.bytes;
+import std.test;
+import msg;
+
+fn test_a_conversation_is_built_message_by_message[&h](heap: &!h Heap) -> [heap] int {
+    var c = msg.empty(heap);
+    let a = msg.text_message(heap, "system", "You help.");
+    c = msg.push(heap, c, a);
+    let b = msg.text_message(heap, "user", "say \"hi\"");
+    c = msg.push(heap, c, b);
+    let d = msg.assistant_message(heap, "", "[{\"id\":\"c1\",\"name\":\"plan\",\"args\":\"{\\\"leg\\\":2}\"}]");
+    c = msg.push(heap, c, d);
+    let e = msg.tool_message(heap, "c1", "plan", "{\"items\":[]}");
+    c = msg.push(heap, c, e);
+    borrow c as &cb in {
+        test.assert(bytes.equal(buffer.bytes(cb), "[{\"role\":\"system\",\"text\":\"You help.\"},{\"role\":\"user\",\"text\":\"say \\\"hi\\\"\"},{\"role\":\"assistant\",\"text\":\"\",\"calls\":[{\"id\":\"c1\",\"name\":\"plan\",\"args\":\"{\\\"leg\\\":2}\"}]},{\"role\":\"tool\",\"id\":\"c1\",\"name\":\"plan\",\"text\":\"{\\\"items\\\":[]}\"}]"));
+    }
+    buffer.drop(heap, c);
+    return 0;
+}
+
+fn test_calls_are_read_back[&h](heap: &!h Heap) -> [heap] int {
+    let m = msg.assistant_message(heap, "thinking", "[{\"id\":\"c1\",\"name\":\"plan\",\"args\":\"{\\\"leg\\\":2}\"},{\"id\":\"c2\",\"name\":\"chat\",\"args\":\"{}\"}]");
+    borrow m as &mb in {
+        test.assert_eq(msg.call_count(heap, buffer.bytes(mb)), 2);
+        let (i0, n0, a0) = msg.call_at(heap, buffer.bytes(mb), 0);
+        borrow i0 as &x in { test.assert(bytes.equal(buffer.bytes(x), "c1")); }
+        borrow n0 as &x in { test.assert(bytes.equal(buffer.bytes(x), "plan")); }
+        borrow a0 as &x in { test.assert(bytes.equal(buffer.bytes(x), "{\"leg\":2}")); }
+        buffer.drop(heap, i0);
+        buffer.drop(heap, n0);
+        buffer.drop(heap, a0);
+        let (i1, n1, a1) = msg.call_at(heap, buffer.bytes(mb), 1);
+        borrow n1 as &x in { test.assert(bytes.equal(buffer.bytes(x), "chat")); }
+        borrow a1 as &x in { test.assert(bytes.equal(buffer.bytes(x), "{}")); }
+        buffer.drop(heap, i1);
+        buffer.drop(heap, n1);
+        buffer.drop(heap, a1);
+        let (i2, n2, a2) = msg.call_at(heap, buffer.bytes(mb), 2);
+        borrow n2 as &x in { test.assert(buffer.size(x) == 0); }
+        buffer.drop(heap, i2);
+        buffer.drop(heap, n2);
+        buffer.drop(heap, a2);
+    }
+    buffer.drop(heap, m);
+    let none = msg.assistant_message(heap, "hello", "[]");
+    borrow none as &nb in {
+        test.assert_eq(msg.call_count(heap, buffer.bytes(nb)), 0);
+    }
+    buffer.drop(heap, none);
+    return 0;
+}

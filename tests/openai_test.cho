@@ -1,0 +1,88 @@
+import std.buffer;
+import std.bytes;
+import std.test;
+import msg;
+import openai;
+
+fn conv[&h](heap: &!h Heap) -> [heap] buffer.Buffer {
+    var c = msg.empty(heap);
+    c = msg.push(heap, c, msg.text_message(heap, "system", "You help."));
+    c = msg.push(heap, c, msg.text_message(heap, "user", "which leg?"));
+    c = msg.push(heap, c, msg.assistant_message(heap, "", "[{\"id\":\"c1\",\"name\":\"plan\",\"args\":\"{\\\"leg\\\":2}\"}]"));
+    c = msg.push(heap, c, msg.tool_message(heap, "c1", "plan", "{\"nights\":3}"));
+    c = msg.push(heap, c, msg.assistant_message(heap, "Three nights.", "[]"));
+    return c;
+}
+
+fn test_a_conversation_and_tools_become_a_request[&h](heap: &!h Heap) -> [heap] int {
+    let c = conv(heap);
+    let tool = msg.tool_def(heap, "plan", "The plan of a leg", "{\"type\":\"object\",\"properties\":{\"leg\":{\"type\":\"integer\"}}}");
+    var tools = msg.empty(heap);
+    tools = msg.push(heap, tools, tool);
+    borrow c as &cb in {
+        borrow tools as &tb in {
+            let r = openai.request(heap, "local-model", 400, buffer.bytes(cb), buffer.bytes(tb));
+            borrow r as &rb in {
+                test.assert(bytes.equal(buffer.bytes(rb), "{\"model\":\"local-model\",\"max_tokens\":400,\"messages\":[{\"role\":\"system\",\"content\":\"You help.\"},{\"role\":\"user\",\"content\":\"which leg?\"},{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"plan\",\"arguments\":\"{\\\"leg\\\":2}\"}}]},{\"role\":\"tool\",\"tool_call_id\":\"c1\",\"content\":\"{\\\"nights\\\":3}\"},{\"role\":\"assistant\",\"content\":\"Three nights.\"}],\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"plan\",\"description\":\"The plan of a leg\",\"parameters\":{\"type\":\"object\",\"properties\":{\"leg\":{\"type\":\"integer\"}}}}}]}"));
+            }
+            buffer.drop(heap, r);
+        }
+    }
+    buffer.drop(heap, c);
+    buffer.drop(heap, tools);
+    return 0;
+}
+
+fn test_no_tools_is_no_tools_key[&h](heap: &!h Heap) -> [heap] int {
+    var c = msg.empty(heap);
+    c = msg.push(heap, c, msg.text_message(heap, "user", "hi"));
+    borrow c as &cb in {
+        let r = openai.request(heap, "m", 10, buffer.bytes(cb), "[]");
+        borrow r as &rb in {
+            test.assert(bytes.equal(buffer.bytes(rb), "{\"model\":\"m\",\"max_tokens\":10,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}"));
+        }
+        buffer.drop(heap, r);
+    }
+    buffer.drop(heap, c);
+    return 0;
+}
+
+fn test_an_answer_with_a_tool_call_is_read[&h](heap: &!h Heap) -> [heap] int {
+    let (ok, m, fin, tin, tout) = openai.reply(heap, "{\"id\":\"x\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"plan\",\"arguments\":\"{\\\"leg\\\":2}\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":5,\"total_tokens\":17}}");
+    test.assert(ok);
+    test.assert_eq(fin, msg.fin_tools());
+    test.assert_eq(tin, 12);
+    test.assert_eq(tout, 5);
+    borrow m as &mb in {
+        test.assert(bytes.equal(buffer.bytes(mb), "{\"role\":\"assistant\",\"text\":\"\",\"calls\":[{\"id\":\"call_1\",\"name\":\"plan\",\"args\":\"{\\\"leg\\\":2}\"}]}"));
+    }
+    buffer.drop(heap, m);
+    return 0;
+}
+
+fn test_a_plain_answer_and_a_cut_one_and_garbage[&h](heap: &!h Heap) -> [heap] int {
+    let (ok, m, fin, tin, tout) = openai.reply(heap, "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"Three nights.\"},\"finish_reason\":\"stop\"}]}");
+    test.assert(ok);
+    test.assert_eq(fin, msg.fin_stop());
+    test.assert_eq(tin, 0);
+    test.assert_eq(tout, 0);
+    borrow m as &mb in {
+        test.assert(bytes.equal(buffer.bytes(mb), "{\"role\":\"assistant\",\"text\":\"Three nights.\"}"));
+    }
+    buffer.drop(heap, m);
+    let (ok2, m2, fin2, a, b) = openai.reply(heap, "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"Thre\"},\"finish_reason\":\"length\"}]}");
+    test.assert(ok2);
+    test.assert_eq(fin2, msg.fin_length());
+    buffer.drop(heap, m2);
+    let (ok3, m3, fin3, c, d) = openai.reply(heap, "{\"error\":{\"message\":\"rate limit\"}}");
+    test.assert(!ok3);
+    test.assert_eq(fin3, msg.fin_other());
+    buffer.drop(heap, m3);
+    let (ok4, m4, fin4, e, f) = openai.reply(heap, "nope");
+    test.assert(!ok4);
+    buffer.drop(heap, m4);
+    let (ok5, m5, fin5, g, h2) = openai.reply(heap, "{\"choices\":[]}");
+    test.assert(!ok5);
+    buffer.drop(heap, m5);
+    return 0;
+}

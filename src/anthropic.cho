@@ -1,0 +1,248 @@
+edition 7;
+
+module anthropic;
+
+import std.buffer;
+import std.json;
+import msg;
+
+// The Anthropic Messages API (`POST /v1/messages`). `request` turns a neutral conversation and tool list into its body: the system messages go to the top-level `system`, the
+// tool results of one turn go together in one user message, as the API wants. `reply` reads its answer back into a neutral assistant message. No transport, no key.
+
+pub fn request[&h, &m, &c, &t](heap: &!h Heap, model: &m [byte], max_tokens: int, conv: &c [byte], tools: &t [byte]) -> [heap] buffer.Buffer {
+    var w = json.writer(heap, 1024);
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "model");
+    w = json.put_string(heap, w, model);
+    w = json.put_key(heap, w, "max_tokens");
+    w = json.put_int(heap, w, max_tokens);
+    let tape = box_slice(heap, 3 * len(conv) + 3, 0);
+    var tape_w = tape;
+    borrow mut tape_w as &!tw in {
+        let tp = contents(tw);
+        if json.parse(conv, tp) >= 0 && json.is_array(tp, 0) {
+            // the system messages, joined
+            var sys = buffer.empty(heap, 16);
+            var have_sys = false;
+            var n = 0;
+            while n < json.count(tp, 0) {
+                let m = json.at(tp, 0, n);
+                if json.string_equals(conv, tp, json.get(conv, tp, m, "role"), "system") {
+                    let text = msg.string_of(heap, conv, tp, json.get(conv, tp, m, "text"));
+                    if have_sys {
+                        sys = buffer.append(heap, sys, "\n\n");
+                    }
+                    have_sys = true;
+                    borrow text as &xb in {
+                        sys = buffer.append(heap, sys, buffer.bytes(xb));
+                    }
+                    buffer.drop(heap, text);
+                }
+                n = n + 1;
+            }
+            borrow sys as &sb in {
+                if len(buffer.bytes(sb)) > 0 {
+                    w = json.put_key(heap, w, "system");
+                    w = json.put_string(heap, w, buffer.bytes(sb));
+                }
+            }
+            buffer.drop(heap, sys);
+            w = json.put_key(heap, w, "messages");
+            w = json.begin_array(heap, w);
+            var open = false;
+            n = 0;
+            while n < json.count(tp, 0) {
+                let m = json.at(tp, 0, n);
+                let role = json.get(conv, tp, m, "role");
+                let text = json.get(conv, tp, m, "text");
+                let is_tool = json.string_equals(conv, tp, role, "tool");
+                if open && !is_tool {
+                    w = json.end_array(heap, w);
+                    w = json.end_object(heap, w);
+                    open = false;
+                }
+                if is_tool {
+                    if !open {
+                        w = json.begin_object(heap, w);
+                        w = json.put_key(heap, w, "role");
+                        w = json.put_string(heap, w, "user");
+                        w = json.put_key(heap, w, "content");
+                        w = json.begin_array(heap, w);
+                        open = true;
+                    }
+                    w = json.begin_object(heap, w);
+                    w = json.put_key(heap, w, "type");
+                    w = json.put_string(heap, w, "tool_result");
+                    w = json.put_key(heap, w, "tool_use_id");
+                    w = msg.put_text(heap, w, conv, tp, json.get(conv, tp, m, "id"));
+                    w = json.put_key(heap, w, "content");
+                    w = msg.put_text(heap, w, conv, tp, text);
+                    w = json.end_object(heap, w);
+                } else if json.string_equals(conv, tp, role, "assistant") {
+                    w = json.begin_object(heap, w);
+                    w = json.put_key(heap, w, "role");
+                    w = json.put_string(heap, w, "assistant");
+                    w = json.put_key(heap, w, "content");
+                    w = json.begin_array(heap, w);
+                    if json.string_length(conv, tp, text) > 0 {
+                        w = json.begin_object(heap, w);
+                        w = json.put_key(heap, w, "type");
+                        w = json.put_string(heap, w, "text");
+                        w = json.put_key(heap, w, "text");
+                        w = msg.put_text(heap, w, conv, tp, text);
+                        w = json.end_object(heap, w);
+                    }
+                    let calls = json.get(conv, tp, m, "calls");
+                    if calls >= 0 && json.is_array(tp, calls) {
+                        var k = 0;
+                        while k < json.count(tp, calls) {
+                            let c = json.at(tp, calls, k);
+                            w = json.begin_object(heap, w);
+                            w = json.put_key(heap, w, "type");
+                            w = json.put_string(heap, w, "tool_use");
+                            w = json.put_key(heap, w, "id");
+                            w = msg.put_text(heap, w, conv, tp, json.get(conv, tp, c, "id"));
+                            w = json.put_key(heap, w, "name");
+                            w = msg.put_text(heap, w, conv, tp, json.get(conv, tp, c, "name"));
+                            w = json.put_key(heap, w, "input");
+                            w = msg.put_json_text(heap, w, conv, tp, json.get(conv, tp, c, "args"));
+                            w = json.end_object(heap, w);
+                            k = k + 1;
+                        }
+                    }
+                    w = json.end_array(heap, w);
+                    w = json.end_object(heap, w);
+                } else if !json.string_equals(conv, tp, role, "system") {
+                    w = json.begin_object(heap, w);
+                    w = json.put_key(heap, w, "role");
+                    w = json.put_string(heap, w, "user");
+                    w = json.put_key(heap, w, "content");
+                    w = msg.put_text(heap, w, conv, tp, text);
+                    w = json.end_object(heap, w);
+                }
+                n = n + 1;
+            }
+            if open {
+                w = json.end_array(heap, w);
+                w = json.end_object(heap, w);
+            }
+            w = json.end_array(heap, w);
+        }
+    }
+    unbox_slice(heap, tape_w);
+    if len(tools) > 2 {
+        let ttape = box_slice(heap, 3 * len(tools) + 3, 0);
+        var ttape_w = ttape;
+        borrow mut ttape_w as &!ttw in {
+            let tp = contents(ttw);
+            if json.parse(tools, tp) >= 0 && json.is_array(tp, 0) && json.count(tp, 0) > 0 {
+                w = json.put_key(heap, w, "tools");
+                w = json.begin_array(heap, w);
+                var n = 0;
+                while n < json.count(tp, 0) {
+                    let d = json.at(tp, 0, n);
+                    w = json.begin_object(heap, w);
+                    w = json.put_key(heap, w, "name");
+                    w = msg.put_text(heap, w, tools, tp, json.get(tools, tp, d, "name"));
+                    w = json.put_key(heap, w, "description");
+                    w = msg.put_text(heap, w, tools, tp, json.get(tools, tp, d, "description"));
+                    w = json.put_key(heap, w, "input_schema");
+                    w = msg.put_json_text(heap, w, tools, tp, json.get(tools, tp, d, "schema"));
+                    w = json.end_object(heap, w);
+                    n = n + 1;
+                }
+                w = json.end_array(heap, w);
+            }
+        }
+        unbox_slice(heap, ttape_w);
+    }
+    w = json.end_object(heap, w);
+    return json.finish(w);
+}
+
+// The answer, read into (ok, a neutral assistant message, why it stopped (`msg.fin_*`), tokens in, tokens out).
+pub fn reply[&h, &b](heap: &!h Heap, body: &b [byte]) -> [heap] (bool, buffer.Buffer, int, int, int) {
+    let tape = box_slice(heap, 3 * len(body) + 3, 0);
+    var tape_w = tape;
+    var ok = false;
+    var message = buffer.empty(heap, 8);
+    var fin = msg.fin_other();
+    var tin = 0;
+    var tout = 0;
+    borrow mut tape_w as &!tw in {
+        let tp = contents(tw);
+        if json.parse(body, tp) >= 0 && json.is_object(tp, 0) {
+            let content = json.get(body, tp, 0, "content");
+            if content >= 0 && json.is_array(tp, content) {
+                ok = true;
+                var text = buffer.empty(heap, 16);
+                var cw = json.writer(heap, 64);
+                cw = json.begin_array(heap, cw);
+                var k = 0;
+                while k < json.count(tp, content) {
+                    let blk = json.at(tp, content, k);
+                    let ty = json.get(body, tp, blk, "type");
+                    if json.string_equals(body, tp, ty, "text") {
+                        let piece = msg.string_of(heap, body, tp, json.get(body, tp, blk, "text"));
+                        borrow piece as &pb in {
+                            text = buffer.append(heap, text, buffer.bytes(pb));
+                        }
+                        buffer.drop(heap, piece);
+                    } else if json.string_equals(body, tp, ty, "tool_use") {
+                        cw = json.begin_object(heap, cw);
+                        cw = json.put_key(heap, cw, "id");
+                        cw = msg.put_text(heap, cw, body, tp, json.get(body, tp, blk, "id"));
+                        cw = json.put_key(heap, cw, "name");
+                        cw = msg.put_text(heap, cw, body, tp, json.get(body, tp, blk, "name"));
+                        cw = json.put_key(heap, cw, "args");
+                        let input = json.get(body, tp, blk, "input");
+                        var iw = json.writer(heap, 32);
+                        if input >= 0 {
+                            iw = msg.put_node(heap, iw, body, tp, input);
+                        } else {
+                            iw = json.put_fragment(heap, iw, "{}");
+                        }
+                        let args = json.finish(iw);
+                        borrow args as &ab in {
+                            cw = json.put_string(heap, cw, buffer.bytes(ab));
+                        }
+                        buffer.drop(heap, args);
+                        cw = json.end_object(heap, cw);
+                    }
+                    k = k + 1;
+                }
+                cw = json.end_array(heap, cw);
+                let calls = json.finish(cw);
+                buffer.drop(heap, message);
+                borrow text as &xb in {
+                    borrow calls as &cb in {
+                        message = msg.assistant_message(heap, buffer.bytes(xb), buffer.bytes(cb));
+                    }
+                }
+                buffer.drop(heap, text);
+                buffer.drop(heap, calls);
+                let sr = json.get(body, tp, 0, "stop_reason");
+                if json.string_equals(body, tp, sr, "end_turn") || json.string_equals(body, tp, sr, "stop_sequence") {
+                    fin = msg.fin_stop();
+                } else if json.string_equals(body, tp, sr, "tool_use") {
+                    fin = msg.fin_tools();
+                } else if json.string_equals(body, tp, sr, "max_tokens") {
+                    fin = msg.fin_length();
+                }
+            }
+            let u = json.get(body, tp, 0, "usage");
+            if u >= 0 && json.is_object(tp, u) {
+                let pi = json.get(body, tp, u, "input_tokens");
+                let po = json.get(body, tp, u, "output_tokens");
+                if pi >= 0 && json.is_int(tp, pi) {
+                    tin = json.to_int(body, tp, pi);
+                }
+                if po >= 0 && json.is_int(tp, po) {
+                    tout = json.to_int(body, tp, po);
+                }
+            }
+        }
+    }
+    unbox_slice(heap, tape_w);
+    return (ok, message, fin, tin, tout);
+}

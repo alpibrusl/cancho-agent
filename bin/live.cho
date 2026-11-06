@@ -1,0 +1,175 @@
+edition 9;
+
+import std.buffer;
+import std.bytes;
+import std.io;
+import anthropic;
+import msg;
+import openai;
+import transport;
+
+// live <anthropic|mistral|local> <key-file> <roots.pem> <host> <ip> <model> <question>: one question to a real model through its adapter, the answer on standard output. For trying the adapters by
+// hand; the tests that use it are opt-in (CANCHO_AGENT_LIVE=1) and are not part of the normal run.
+
+fn say[&i, &t](io: &!i Io, text: &t [byte]) -> [io_write] int {
+    return io.write_all(io, text);
+}
+
+fn slurp[&h, &f, &p](heap: &!h Heap, fs: &f Fs(""), path: &p [byte], cap: int) -> [heap, fs_read("")] (buffer.Buffer, bool) {
+    let store = box_slice(heap, cap, byte_of(0));
+    var out = buffer.empty(heap, 16);
+    var ok = false;
+    borrow mut store as &!sw in {
+        let n = fs_read(fs, path, contents(sw));
+        if n >= 0 {
+            ok = true;
+            out = buffer.append(heap, out, contents(sw)[0..n]);
+        }
+    }
+    unbox_slice(heap, store);
+    return (out, ok);
+}
+
+
+fn go[&h, &f, &n, &c, &i, &g](heap: &!h Heap, fs: &f Fs(""), net: &n Net(""), clock: &c Clock, io: &!i Io, args: &g Args) -> [heap, args, fs_read(""), net_out(""), conn_read, conn_write, poll, clock, io_write] int {
+    if arg_count(args) < 8 {
+        say(io, "usage: live <anthropic|mistral|local> <key-file> <roots.pem> <host> <ip> <model> <question>\n");
+        return 2;
+    }
+    let kind = arg(args, 1);
+    let (key_raw, kok) = slurp(heap, fs, arg(args, 2), 4096);
+    let (roots, rok) = slurp(heap, fs, arg(args, 3), 4194304);
+    if !kok || !rok {
+        say(io, "cannot read the key or the roots\n");
+        buffer.drop(heap, key_raw);
+        buffer.drop(heap, roots);
+        return 2;
+    }
+    var key = buffer.empty(heap, 64);
+    borrow key_raw as &kr in {
+        var e = len(buffer.bytes(kr));
+        while e > 0 && (int_of(buffer.bytes(kr)[e - 1]) == 10 || int_of(buffer.bytes(kr)[e - 1]) == 13 || int_of(buffer.bytes(kr)[e - 1]) == 32) {
+            e = e - 1;
+        }
+        key = buffer.append(heap, key, buffer.bytes(kr)[0..e]);
+    }
+    buffer.drop(heap, key_raw);
+    var entropy = box_slice(heap, 32, byte_of(0));
+    borrow mut entropy as &!ew in {
+        fs_read(fs, "/dev/urandom", contents(ew));
+    }
+    var conv = msg.empty(heap);
+    conv = msg.push(heap, conv, msg.text_message(heap, "system", "Answer in one short sentence."));
+    conv = msg.push(heap, conv, msg.text_message(heap, "user", arg(args, 7)));
+    let is_anthropic = bytes.equal(kind, "anthropic");
+    var body = buffer.empty(heap, 16);
+    var headers = buffer.empty(heap, 256);
+    var path = "/v1/chat/completions";
+    borrow conv as &cb in {
+        buffer.drop(heap, body);
+        if is_anthropic {
+            body = anthropic.request(heap, arg(args, 6), 200, buffer.bytes(cb), "[]");
+        } else {
+            body = openai.request(heap, arg(args, 6), 200, buffer.bytes(cb), "[]");
+        }
+    }
+    buffer.drop(heap, conv);
+    if is_anthropic {
+        path = "/v1/messages";
+        headers = buffer.append(heap, headers, "x-api-key: ");
+        borrow key as &kb in {
+            headers = buffer.append(heap, headers, buffer.bytes(kb));
+        }
+        headers = buffer.append(heap, headers, "\r\nanthropic-version: 2023-06-01\r\nContent-Type: application/json\r\n");
+    } else {
+        headers = buffer.append(heap, headers, "Authorization: Bearer ");
+        borrow key as &kb in {
+            headers = buffer.append(heap, headers, buffer.bytes(kb));
+        }
+        headers = buffer.append(heap, headers, "\r\nContent-Type: application/json\r\n");
+    }
+    buffer.drop(heap, key);
+    var rc = 1;
+    borrow body as &bb in {
+        borrow headers as &hb in {
+            borrow roots as &rb in {
+                borrow mut entropy as &!ew in {
+                    match transport.exchange(heap, net, clock, io, arg(args, 4), 443, true, path, buffer.bytes(hb), buffer.bytes(bb), buffer.bytes(rb), arg(args, 5), contents(ew), 33554432, 120000) {
+                        transport.Answered::Ok(status, out) => {
+                            borrow out as &ob in {
+                                var ok = false;
+                                var m = buffer.empty(heap, 8);
+                                if is_anthropic {
+                                    let (o2, m2, f2, a2, b2) = anthropic.reply(heap, buffer.bytes(ob));
+                                    ok = o2;
+                                    buffer.drop(heap, m);
+                                    m = m2;
+                                } else {
+                                    let (o3, m3, f3, a3, b3) = openai.reply(heap, buffer.bytes(ob));
+                                    ok = o3;
+                                    buffer.drop(heap, m);
+                                    m = m3;
+                                }
+                                if ok {
+                                    say(io, "ok\n");
+                                    borrow m as &mb in {
+                                        say(io, buffer.bytes(mb));
+                                    }
+                                    say(io, "\n");
+                                    rc = 0;
+                                } else {
+                                    say(io, "not an answer:\n");
+                                    say(io, buffer.bytes(ob));
+                                    say(io, "\n");
+                                }
+                                buffer.drop(heap, m);
+                            }
+                            buffer.drop(heap, out);
+                        }
+                        transport.Answered::Failed(tag) => {
+                            say(io, "the transport failed: ");
+                            say(io, transport.tag_of(tag));
+                            say(io, "\n");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    buffer.drop(heap, body);
+    buffer.drop(heap, headers);
+    buffer.drop(heap, roots);
+    unbox_slice(heap, entropy);
+    return rc;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec, tty } = split(world);
+    release(tty);
+    release(ffi);
+    release(signals);
+    release(exec);
+    var console = io;
+    var h = heap;
+    var rc = 1;
+    borrow args as &g in {
+        borrow net as &n in {
+            borrow clock as &c in {
+                borrow fs as &f in {
+                    borrow mut console as &!i in {
+                        borrow mut h as &!hh in {
+                            rc = go(hh, f, n, c, i, g);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    release(net);
+    release(clock);
+    release(fs);
+    release(console);
+    release(h);
+    release(args);
+    return rc;
+}

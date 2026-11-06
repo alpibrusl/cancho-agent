@@ -1,0 +1,87 @@
+import std.buffer;
+import std.bytes;
+import std.test;
+import anthropic;
+import msg;
+
+fn conv[&h](heap: &!h Heap) -> [heap] buffer.Buffer {
+    var c = msg.empty(heap);
+    c = msg.push(heap, c, msg.text_message(heap, "system", "You help."));
+    c = msg.push(heap, c, msg.text_message(heap, "system", "Be short."));
+    c = msg.push(heap, c, msg.text_message(heap, "user", "which legs?"));
+    c = msg.push(heap, c, msg.assistant_message(heap, "Let me look.", "[{\"id\":\"c1\",\"name\":\"plan\",\"args\":\"{\\\"leg\\\":1}\"},{\"id\":\"c2\",\"name\":\"plan\",\"args\":\"{\\\"leg\\\":2}\"}]"));
+    c = msg.push(heap, c, msg.tool_message(heap, "c1", "plan", "two nights"));
+    c = msg.push(heap, c, msg.tool_message(heap, "c2", "plan", "three nights"));
+    c = msg.push(heap, c, msg.assistant_message(heap, "Two, then three.", "[]"));
+    c = msg.push(heap, c, msg.text_message(heap, "user", "thanks"));
+    return c;
+}
+
+fn test_a_conversation_and_tools_become_a_request[&h](heap: &!h Heap) -> [heap] int {
+    let c = conv(heap);
+    var tools = msg.empty(heap);
+    tools = msg.push(heap, tools, msg.tool_def(heap, "plan", "The plan of a leg", "{\"type\":\"object\"}"));
+    borrow c as &cb in {
+        borrow tools as &tb in {
+            let r = anthropic.request(heap, "claude-haiku-5-5", 300, buffer.bytes(cb), buffer.bytes(tb));
+            borrow r as &rb in {
+                test.assert(bytes.equal(buffer.bytes(rb), "{\"model\":\"claude-haiku-5-5\",\"max_tokens\":300,\"system\":\"You help.\\n\\nBe short.\",\"messages\":[{\"role\":\"user\",\"content\":\"which legs?\"},{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Let me look.\"},{\"type\":\"tool_use\",\"id\":\"c1\",\"name\":\"plan\",\"input\":{\"leg\":1}},{\"type\":\"tool_use\",\"id\":\"c2\",\"name\":\"plan\",\"input\":{\"leg\":2}}]},{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"c1\",\"content\":\"two nights\"},{\"type\":\"tool_result\",\"tool_use_id\":\"c2\",\"content\":\"three nights\"}]},{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Two, then three.\"}]},{\"role\":\"user\",\"content\":\"thanks\"}],\"tools\":[{\"name\":\"plan\",\"description\":\"The plan of a leg\",\"input_schema\":{\"type\":\"object\"}}]}"));
+            }
+            buffer.drop(heap, r);
+        }
+    }
+    buffer.drop(heap, c);
+    buffer.drop(heap, tools);
+    return 0;
+}
+
+fn test_tool_results_at_the_end_are_closed[&h](heap: &!h Heap) -> [heap] int {
+    var c = msg.empty(heap);
+    c = msg.push(heap, c, msg.text_message(heap, "user", "go"));
+    c = msg.push(heap, c, msg.assistant_message(heap, "", "[{\"id\":\"c1\",\"name\":\"plan\",\"args\":\"\"}]"));
+    c = msg.push(heap, c, msg.tool_message(heap, "c1", "plan", "ok"));
+    borrow c as &cb in {
+        let r = anthropic.request(heap, "m", 10, buffer.bytes(cb), "[]");
+        borrow r as &rb in {
+            test.assert(bytes.equal(buffer.bytes(rb), "{\"model\":\"m\",\"max_tokens\":10,\"messages\":[{\"role\":\"user\",\"content\":\"go\"},{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"c1\",\"name\":\"plan\",\"input\":{}}]},{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"c1\",\"content\":\"ok\"}]}]}"));
+        }
+        buffer.drop(heap, r);
+    }
+    buffer.drop(heap, c);
+    return 0;
+}
+
+fn test_an_answer_with_text_and_a_tool_use_is_read[&h](heap: &!h Heap) -> [heap] int {
+    let (ok, m, fin, tin, tout) = anthropic.reply(heap, "{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Let me look.\"},{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"plan\",\"input\":{\"leg\":2,\"deep\":{\"a\":[1,true,null,\"x\\\"y\"]}}}],\"stop_reason\":\"tool_use\",\"usage\":{\"input_tokens\":12,\"output_tokens\":5}}");
+    test.assert(ok);
+    test.assert_eq(fin, msg.fin_tools());
+    test.assert_eq(tin, 12);
+    test.assert_eq(tout, 5);
+    borrow m as &mb in {
+        test.assert(bytes.equal(buffer.bytes(mb), "{\"role\":\"assistant\",\"text\":\"Let me look.\",\"calls\":[{\"id\":\"toolu_1\",\"name\":\"plan\",\"args\":\"{\\\"leg\\\":2,\\\"deep\\\":{\\\"a\\\":[1,true,null,\\\"x\\\\\\\"y\\\"]}}\"}]}"));
+    }
+    buffer.drop(heap, m);
+    return 0;
+}
+
+fn test_plain_cut_and_garbage_answers[&h](heap: &!h Heap) -> [heap] int {
+    let (ok, m, fin, a, b) = anthropic.reply(heap, "{\"content\":[{\"type\":\"text\",\"text\":\"Two, \"},{\"type\":\"text\",\"text\":\"then three.\"}],\"stop_reason\":\"end_turn\"}");
+    test.assert(ok);
+    test.assert_eq(fin, msg.fin_stop());
+    borrow m as &mb in {
+        test.assert(bytes.equal(buffer.bytes(mb), "{\"role\":\"assistant\",\"text\":\"Two, then three.\"}"));
+    }
+    buffer.drop(heap, m);
+    let (ok2, m2, fin2, c, d) = anthropic.reply(heap, "{\"content\":[{\"type\":\"text\",\"text\":\"Tw\"}],\"stop_reason\":\"max_tokens\"}");
+    test.assert(ok2);
+    test.assert_eq(fin2, msg.fin_length());
+    buffer.drop(heap, m2);
+    let (ok3, m3, fin3, e, f) = anthropic.reply(heap, "{\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"}}");
+    test.assert(!ok3);
+    test.assert_eq(fin3, msg.fin_other());
+    buffer.drop(heap, m3);
+    let (ok4, m4, fin4, g, i) = anthropic.reply(heap, "nope");
+    test.assert(!ok4);
+    buffer.drop(heap, m4);
+    return 0;
+}
