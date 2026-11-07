@@ -394,3 +394,139 @@ pub fn prefixed[&h, &t, &p](heap: &!h Heap, tools: &t [byte], prefix: &p [byte])
     unbox_slice(heap, tape_w);
     return out;
 }
+
+// What an HTTP server answered, as the lines `find_response` reads: one JSON message per line. A body that opens with `{` is one JSON message (its raw line breaks are whitespace, so a
+// pretty-printed answer is still one line). Anything else is read as a Server-Sent Events stream (`text/event-stream`): the `data:` lines of an event, joined by a space, are one
+// message; comments (`:`), `event:`, `id:` and `retry:` lines are ignored, and an event with no data (the priming event of a resumable stream) is nothing. CRLF and LF both end a
+// line; an event that the stream ends in the middle of is still read. The spec names no event type for the final answer, so the answer is the message whose id matches.
+pub fn http_lines[&h, &o](heap: &!h Heap, body: &o [byte]) -> [heap] buffer.Buffer {
+    var out = buffer.empty(heap, len(body) + 2);
+    var first = 0;
+    while first < len(body) && (int_of(body[first]) == 32 || int_of(body[first]) == 9 || int_of(body[first]) == 10 || int_of(body[first]) == 13) {
+        first = first + 1;
+    }
+    if first < len(body) && int_of(body[first]) == 123 {
+        var k = first;
+        while k < len(body) {
+            if int_of(body[k]) == 10 || int_of(body[k]) == 13 {
+                out = buffer.push(heap, out, byte_of(32));
+            } else {
+                out = buffer.push(heap, out, body[k]);
+            }
+            k = k + 1;
+        }
+        return buffer.push(heap, out, byte_of(10));
+    }
+    var ev = buffer.empty(heap, 64);
+    var have = false;
+    var start = 0;
+    var j = 0;
+    while j <= len(body) {
+        if j == len(body) || int_of(body[j]) == 10 {
+            var end = j;
+            if end > start && int_of(body[end - 1]) == 13 {
+                end = end - 1;
+            }
+            let line = body[start..end];
+            if len(line) == 0 || j == len(body) {
+                if j == len(body) && len(line) > 0 && len(line) >= 5 && bytes.equal(line[0..5], "data:") {
+                    var f = 5;
+                    if f < len(line) && int_of(line[f]) == 32 {
+                        f = f + 1;
+                    }
+                    if have {
+                        ev = buffer.push(heap, ev, byte_of(32));
+                    }
+                    ev = buffer.append(heap, ev, line[f..len(line)]);
+                    have = true;
+                }
+                borrow ev as &eb in {
+                    if len(buffer.bytes(eb)) > 0 {
+                        out = buffer.append(heap, out, buffer.bytes(eb));
+                        out = buffer.push(heap, out, byte_of(10));
+                    }
+                }
+                buffer.drop(heap, ev);
+                ev = buffer.empty(heap, 64);
+                have = false;
+            } else if len(line) >= 5 && bytes.equal(line[0..5], "data:") {
+                var f = 5;
+                if f < len(line) && int_of(line[f]) == 32 {
+                    f = f + 1;
+                }
+                if have {
+                    ev = buffer.push(heap, ev, byte_of(32));
+                }
+                ev = buffer.append(heap, ev, line[f..len(line)]);
+                have = true;
+            }
+            start = j + 1;
+        }
+        j = j + 1;
+    }
+    buffer.drop(heap, ev);
+    return out;
+}
+
+// The header lines of a POST, each ending CRLF. An empty `version`, `method`, `name` or `sid` leaves its line out; `extra` (the caller's own lines, an `Authorization: Bearer` among
+// them) goes last and is written as given.
+pub fn http_headers[&h, &e, &v, &m, &n, &s](heap: &!h Heap, extra: &e [byte], version: &v [byte], method: &m [byte], name: &n [byte], sid: &s [byte]) -> [heap] buffer.Buffer {
+    var b = buffer.append(heap, buffer.empty(heap, 256), "Accept: application/json, text/event-stream\r\nContent-Type: application/json\r\n");
+    if len(version) > 0 {
+        b = buffer.append(heap, b, "MCP-Protocol-Version: ");
+        b = buffer.append(heap, b, version);
+        b = buffer.append(heap, b, "\r\n");
+    }
+    if len(method) > 0 {
+        b = buffer.append(heap, b, "Mcp-Method: ");
+        b = buffer.append(heap, b, method);
+        b = buffer.append(heap, b, "\r\n");
+    }
+    if len(name) > 0 {
+        b = buffer.append(heap, b, "Mcp-Name: ");
+        b = buffer.append(heap, b, name);
+        b = buffer.append(heap, b, "\r\n");
+    }
+    if len(sid) > 0 {
+        b = buffer.append(heap, b, "Mcp-Session-Id: ");
+        b = buffer.append(heap, b, sid);
+        b = buffer.append(heap, b, "\r\n");
+    }
+    return buffer.append(heap, b, extra);
+}
+
+// Is `name` printable ASCII with nothing the header could be confused by? (The modern spec has a base64 form for the rest; it is not built, so such a name is refused.)
+pub fn plain_name[&k](name: &k [byte]) -> [] bool {
+    if len(name) == 0 || len(name) > 128 {
+        return false;
+    }
+    var i = 0;
+    while i < len(name) {
+        let c = int_of(name[i]);
+        if c < 33 || c > 126 {
+            return false;
+        }
+        i = i + 1;
+    }
+    if len(name) >= 9 && bytes.equal(name[0..9], "=?base64?") {
+        return false;
+    }
+    return true;
+}
+
+// Is `text` visible ASCII (0x21 to 0x7E), or empty? What a session id must be to be written into a header line.
+pub fn visible_ascii[&k](text: &k [byte]) -> [] bool {
+    if len(text) == 0 {
+        return true;
+    }
+    var i = 0;
+    while i < len(text) {
+        let c = int_of(text[i]);
+        if c < 33 || c > 126 {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+

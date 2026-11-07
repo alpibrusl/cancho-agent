@@ -1,0 +1,332 @@
+edition 7;
+
+module mcp_http;
+
+import std.buffer;
+import std.bytes;
+import std.io;
+import mcp;
+import msg;
+import transport;
+
+// An MCP server reached over HTTP (the "Streamable HTTP" transport), one request at a time (cancho-agent, docs/design.md section 7). The same three calls as `mcp_stdio` (`detect`,
+// `list_tools`, `call_tool`) with the same codes, so the assistant can hold a server of either kind. Written from the specification as read on 2026-11-07 (revision 2026-07-28 and
+// the legacy 2025-11-25): every message is a POST of one JSON-RPC message to one endpoint, and the answer is either JSON or a Server-Sent Events stream that ends after the answer
+// (`mcp.http_lines` reads both). Nothing here is a default: the host, the port, whether it is TLS, the path, the address it resolves to and the bearer header are the caller's.
+//
+//   modern (2026-07-28)  no session: each POST carries `MCP-Protocol-Version`, `Mcp-Method` and (for `tools/call`) `Mcp-Name`, and the same version in the message's `_meta`
+//   legacy (2025-11-25)  each request is its own short session: `initialize` (the server may answer with `Mcp-Session-Id`), `notifications/initialized`, the request, all with the
+//                        session id and `MCP-Protocol-Version`
+//
+// Not done, said here and in the design: the session is not ended with HTTP DELETE (the transport only POSTs; the spec lets a server expire a session on its own), a tool whose
+// schema marks a parameter `x-mcp-header` is called without the `Mcp-Param-*` header the modern spec asks a client to mirror (a server that insists answers 400, and the model is told),
+// a tool name that is not plain ASCII is refused, a modern server is not asked for `subscriptions/listen`, and a server that streams a progress message before the answer is read
+// to its end. A real server is the real test: none has been tried, only a fake one written from the same reading.
+//
+// Codes: 0 ok, 1 the server could not be reached, 2 it answered 200 and the answer is not in it, 3 it answered with a JSON-RPC error, 4 the answer is not what the call needs,
+// 5 it answered an HTTP status other than 200 (`status` says which).
+
+pub fn ok() -> [] int {
+    return 0;
+}
+
+pub fn not_run() -> [] int {
+    return 1;
+}
+
+pub fn no_answer() -> [] int {
+    return 2;
+}
+
+pub fn answered_error() -> [] int {
+    return 3;
+}
+
+pub fn unreadable() -> [] int {
+    return 4;
+}
+
+pub fn refused() -> [] int {
+    return 5;
+}
+
+fn max_out() -> [] int {
+    return 1048576;
+}
+
+fn max_pages() -> [] int {
+    return 5;
+}
+
+// The session id a server may have handed out is used only if it is visible ASCII (`mcp.visible_ascii`); anything else is treated as none.
+fn clean_sid[&h](heap: &!h Heap, sid: buffer.Buffer) -> [heap] buffer.Buffer {
+    var good = false;
+    borrow sid as &sb in {
+        good = mcp.visible_ascii(buffer.bytes(sb));
+    }
+    if good {
+        return sid;
+    }
+    buffer.drop(heap, sid);
+    return buffer.empty(heap, 1);
+}
+
+// One POST: the status (or the negative of the transport's failure tag), the body, and the session id the server sent (empty if none).
+fn post[&h, &n, &c, &i, &t, &p, &x, &b, &r, &a, &e](heap: &!h Heap, net: &n Net(""), clock: &c Clock, io: &!i Io, host: &t [byte], port: int, secure: bool, path: &p [byte], hdrs: &x [byte], body: &b [byte], roots: &r [byte], ip: &a [byte], entropy: &e [byte], wait_ms: int) -> [heap, net_out(""), conn_read, conn_write, poll, clock] (int, buffer.Buffer, buffer.Buffer) {
+    let (answer, sid) = transport.exchange_sid(heap, net, clock, io, host, port, secure, path, hdrs, body, roots, ip, entropy, max_out(), wait_ms);
+    match answer {
+        transport.Answered::Ok(st, out) => {
+            return (st, out, sid);
+        }
+        transport.Answered::Failed(tag) => {
+            return (0 - tag, buffer.empty(heap, 1), sid);
+        }
+    }
+}
+
+// What the answer to request `id` says: (code, the JSON line of the answer, the status).
+fn read_answer[&h](heap: &!h Heap, status: int, body: buffer.Buffer, id: int) -> [heap] (int, buffer.Buffer, int) {
+    var code = ok();
+    var line = buffer.empty(heap, 1);
+    if status < 0 {
+        code = not_run();
+    } else if status != 200 {
+        code = refused();
+    } else {
+        borrow body as &bb in {
+            let lines = mcp.http_lines(heap, buffer.bytes(bb));
+            borrow lines as &lb in {
+                let (kind, found) = mcp.find_response(heap, buffer.bytes(lb), id);
+                if kind == 0 {
+                    code = no_answer();
+                    buffer.drop(heap, found);
+                } else {
+                    buffer.drop(heap, line);
+                    line = found;
+                    if kind == 2 {
+                        code = answered_error();
+                    }
+                }
+            }
+            buffer.drop(heap, lines);
+        }
+    }
+    buffer.drop(heap, body);
+    return (code, line, status);
+}
+
+// One request of `era`, with the handshake of the legacy era before it. `method` and `name` fill the modern `Mcp-Method` and `Mcp-Name` headers. Answers (code, line, status).
+fn ask[&h, &n, &c, &i, &t, &p, &x, &r, &a, &e, &m, &k, &q](heap: &!h Heap, net: &n Net(""), clock: &c Clock, io: &!i Io, host: &t [byte], port: int, secure: bool, path: &p [byte], extra: &x [byte], roots: &r [byte], ip: &a [byte], entropy: &e [byte], wait_ms: int, era: int, method: &m [byte], name: &k [byte], request: &q [byte], id: int) -> [heap, net_out(""), conn_read, conn_write, poll, clock] (int, buffer.Buffer, int) {
+    if era == mcp.era_modern() {
+        let h = mcp.http_headers(heap, extra, mcp.modern_version(), method, name, "");
+        var m_code = not_run();
+        var m_line = buffer.empty(heap, 1);
+        var m_status = 0;
+        borrow h as &hb in {
+            let (st, body, sid) = post(heap, net, clock, io, host, port, secure, path, buffer.bytes(hb), request, roots, ip, entropy, wait_ms);
+            buffer.drop(heap, sid);
+            let (rc, rl, rs) = read_answer(heap, st, body, id);
+            m_code = rc;
+            buffer.drop(heap, m_line);
+            m_line = rl;
+            m_status = rs;
+        }
+        buffer.drop(heap, h);
+        return (m_code, m_line, m_status);
+    }
+    // legacy: initialize, then the notification, then the request, all one session
+    let h0 = mcp.http_headers(heap, extra, "", "", "", "");
+    let init = mcp.initialize(heap, 1);
+    var sid0 = buffer.empty(heap, 1);
+    var c1 = ok();
+    var l1 = buffer.empty(heap, 1);
+    var s1 = 0;
+    borrow h0 as &h0b in {
+        borrow init as &ib in {
+            let (st, body, s) = post(heap, net, clock, io, host, port, secure, path, buffer.bytes(h0b), buffer.bytes(ib), roots, ip, entropy, wait_ms);
+            buffer.drop(heap, sid0);
+            sid0 = clean_sid(heap, s);
+            let (rc, rl, rs) = read_answer(heap, st, body, 1);
+            c1 = rc;
+            buffer.drop(heap, l1);
+            l1 = rl;
+            s1 = rs;
+        }
+    }
+    buffer.drop(heap, h0);
+    buffer.drop(heap, init);
+    if c1 != ok() {
+        buffer.drop(heap, sid0);
+        return (c1, l1, s1);
+    }
+    buffer.drop(heap, l1);
+    var r_code = not_run();
+    var r_line = buffer.empty(heap, 1);
+    var r_status = 0;
+    borrow sid0 as &sb in {
+        let h1 = mcp.http_headers(heap, extra, mcp.legacy_version(), "", "", buffer.bytes(sb));
+        let note = mcp.initialized(heap);
+        var note_status = 0;
+        borrow h1 as &h1b in {
+            borrow note as &nb in {
+                let (st, body, s) = post(heap, net, clock, io, host, port, secure, path, buffer.bytes(h1b), buffer.bytes(nb), roots, ip, entropy, wait_ms);
+                note_status = st;
+                buffer.drop(heap, body);
+                buffer.drop(heap, s);
+            }
+        }
+        buffer.drop(heap, note);
+        if note_status < 0 {
+            r_code = not_run();
+        } else if note_status >= 400 {
+            r_code = refused();
+            r_status = note_status;
+        } else {
+            borrow h1 as &h2b in {
+                let (st, body, s) = post(heap, net, clock, io, host, port, secure, path, buffer.bytes(h2b), request, roots, ip, entropy, wait_ms);
+                buffer.drop(heap, s);
+                let (rc, rl, rs) = read_answer(heap, st, body, id);
+                r_code = rc;
+                buffer.drop(heap, r_line);
+                r_line = rl;
+                r_status = rs;
+            }
+        }
+        buffer.drop(heap, h1);
+    }
+    buffer.drop(heap, sid0);
+    return (r_code, r_line, r_status);
+}
+
+fn request_id(era: int) -> [] int {
+    if era == mcp.era_legacy() {
+        return 2;
+    }
+    return 1;
+}
+
+// The era of the server: modern if it answers `server/discover` with a result, legacy if it answers anything else, -1 if it cannot be reached.
+pub fn detect[&h, &n, &c, &i, &t, &p, &x, &r, &a, &e](heap: &!h Heap, net: &n Net(""), clock: &c Clock, io: &!i Io, host: &t [byte], port: int, secure: bool, path: &p [byte], extra: &x [byte], roots: &r [byte], ip: &a [byte], entropy: &e [byte], wait_ms: int) -> [heap, net_out(""), conn_read, conn_write, poll, clock] int {
+    let req = mcp.discover(heap, 1);
+    var era = 0 - 1;
+    borrow req as &rb in {
+        let (code, line, status) = ask(heap, net, clock, io, host, port, secure, path, extra, roots, ip, entropy, wait_ms, mcp.era_modern(), "server/discover", "", buffer.bytes(rb), 1);
+        if code == ok() {
+            era = mcp.era_modern();
+        } else if code != not_run() {
+            era = mcp.era_legacy();
+        }
+        buffer.drop(heap, line);
+    }
+    buffer.drop(heap, req);
+    return era;
+}
+
+// The tools of the server in the neutral form of `msg`, all pages (at most five); with `read_only` only the ones that say they only read. `era_in` is `mcp.era_*` (or
+// `mcp.era_auto()`, found out first).
+pub fn list_tools[&h, &n, &c, &i, &t, &p, &x, &r, &a, &e](heap: &!h Heap, net: &n Net(""), clock: &c Clock, io: &!i Io, host: &t [byte], port: int, secure: bool, path: &p [byte], extra: &x [byte], roots: &r [byte], ip: &a [byte], entropy: &e [byte], wait_ms: int, era_in: int, read_only: bool) -> [heap, net_out(""), conn_read, conn_write, poll, clock] (int, buffer.Buffer) {
+    var era = era_in;
+    if era == mcp.era_auto() {
+        era = detect(heap, net, clock, io, host, port, secure, path, extra, roots, ip, entropy, wait_ms);
+    }
+    if era < 0 {
+        return (not_run(), msg.empty(heap));
+    }
+    var all = msg.empty(heap);
+    var cursor = buffer.empty(heap, 8);
+    var code = ok();
+    var page = 0;
+    var more = true;
+    while more && page < max_pages() {
+        more = false;
+        var req = buffer.empty(heap, 1);
+        borrow cursor as &cb in {
+            buffer.drop(heap, req);
+            req = mcp.tools_list(heap, request_id(era), era == mcp.era_modern(), buffer.bytes(cb));
+        }
+        borrow req as &rb in {
+            let (c1, line, status) = ask(heap, net, clock, io, host, port, secure, path, extra, roots, ip, entropy, wait_ms, era, "tools/list", "", buffer.bytes(rb), request_id(era));
+            code = c1;
+            if c1 == ok() {
+                borrow line as &lb in {
+                    let (tools, next) = mcp.tools_page(heap, buffer.bytes(lb), read_only);
+                    var joined = buffer.empty(heap, 1);
+                    borrow tools as &tb in {
+                        borrow all as &ab in {
+                            buffer.drop(heap, joined);
+                            joined = mcp.join_arrays(heap, buffer.bytes(ab), buffer.bytes(tb));
+                        }
+                    }
+                    buffer.drop(heap, all);
+                    all = joined;
+                    buffer.drop(heap, tools);
+                    buffer.drop(heap, cursor);
+                    cursor = next;
+                    borrow cursor as &c2 in {
+                        more = len(buffer.bytes(c2)) > 0;
+                    }
+                }
+            }
+            buffer.drop(heap, line);
+        }
+        buffer.drop(heap, req);
+        page = page + 1;
+    }
+    buffer.drop(heap, cursor);
+    return (code, all);
+}
+
+fn say[&h](heap: &!h Heap, text: &static [byte]) -> [heap] buffer.Buffer {
+    return buffer.append(heap, buffer.empty(heap, 64), text);
+}
+
+// Call tool `name` with `arguments` (JSON text of an object). Answers (code, whether the tool itself failed, the text for the model). As with `mcp_stdio.call_tool`, a protocol
+// error or a server that said nothing is a short sentence of ours, so a server's own words are never taken for a tool's result.
+pub fn call_tool[&h, &n, &c, &i, &t, &p, &x, &r, &a, &e, &k, &u](heap: &!h Heap, net: &n Net(""), clock: &c Clock, io: &!i Io, host: &t [byte], port: int, secure: bool, path: &p [byte], extra: &x [byte], roots: &r [byte], ip: &a [byte], entropy: &e [byte], wait_ms: int, era_in: int, name: &k [byte], arguments: &u [byte]) -> [heap, net_out(""), conn_read, conn_write, poll, clock] (int, bool, buffer.Buffer) {
+    var era = era_in;
+    if era == mcp.era_auto() {
+        era = detect(heap, net, clock, io, host, port, secure, path, extra, roots, ip, entropy, wait_ms);
+    }
+    if era < 0 {
+        return (not_run(), true, say(heap, "The tool server could not be reached."));
+    }
+    if !mcp.plain_name(name) {
+        return (unreadable(), true, say(heap, "The tool name cannot be sent to the tool server."));
+    }
+    let req = mcp.tools_call(heap, request_id(era), era == mcp.era_modern(), name, arguments);
+    var code = ok();
+    var is_error = false;
+    var text = buffer.empty(heap, 16);
+    borrow req as &rb in {
+        let (c1, line, status) = ask(heap, net, clock, io, host, port, secure, path, extra, roots, ip, entropy, wait_ms, era, "tools/call", name, buffer.bytes(rb), request_id(era));
+        code = c1;
+        buffer.drop(heap, text);
+        if c1 == not_run() {
+            text = say(heap, "The tool server could not be reached.");
+        } else if c1 == refused() {
+            text = say(heap, "The tool server refused the request with HTTP status ");
+            text = buffer.push_nat(heap, text, status);
+            text = buffer.append(heap, text, ".");
+        } else if c1 == no_answer() {
+            text = say(heap, "The tool server did not answer.");
+        } else if c1 == answered_error() {
+            text = say(heap, "The tool server refused the call: ");
+            borrow line as &lnb in {
+                let et = mcp.error_text(heap, buffer.bytes(lnb));
+                borrow et as &eb in {
+                    text = buffer.append(heap, text, buffer.bytes(eb));
+                }
+                buffer.drop(heap, et);
+            }
+        } else {
+            borrow line as &lb in {
+                let (failed, t) = mcp.call_text(heap, buffer.bytes(lb));
+                is_error = failed;
+                text = t;
+            }
+        }
+        buffer.drop(heap, line);
+    }
+    buffer.drop(heap, req);
+    return (code, is_error || code != ok(), text);
+}

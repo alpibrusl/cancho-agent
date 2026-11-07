@@ -1,0 +1,175 @@
+edition 9;
+
+import std.buffer;
+import std.bytes;
+import std.io;
+import mcp;
+import mcp_http;
+import msg;
+import transport;
+
+// mcp_http_check <port> <modern-json|modern-sse|legacy-json|legacy-sse|auth|silent|down>: the HTTP client against a fake server on 127.0.0.1 (tests/mcp_http_check.sh starts it).
+
+fn say[&i, &t](io: &!i Io, text: &t [byte]) -> [io_write] int {
+    return io.write_all(io, text);
+}
+
+fn mark[&i](io: &!i Io, good: bool, name: &static [byte]) -> [io_write] int {
+    if good {
+        say(io, "ok   ");
+        say(io, name);
+        say(io, "\n");
+        return 0;
+    }
+    say(io, "FAIL ");
+    say(io, name);
+    say(io, "\n");
+    return 1;
+}
+
+fn has[&b](text: &b [byte], needle: &static [byte]) -> [] bool {
+    var i = 0;
+    while i + len(needle) <= len(text) {
+        if bytes.equal(text[i..i + len(needle)], needle) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn port_of[&p](text: &p [byte]) -> [] int {
+    var n = 0;
+    var i = 0;
+    while i < len(text) {
+        n = n * 10 + (int_of(text[i]) - 48);
+        i = i + 1;
+    }
+    return n;
+}
+
+fn run[&h, &n, &c, &i, &g](heap: &!h Heap, net: &n Net(""), clock: &c Clock, io: &!i Io, args: &g Args) -> [heap, args, net_out(""), conn_read, conn_write, poll, clock, io_write] int {
+    if arg_count(args) < 3 {
+        say(io, "usage: mcp_http_check <port> <kind>\n");
+        return 2;
+    }
+    let port = port_of(arg(args, 1));
+    let kind = arg(args, 2);
+    var entropy = box_slice(heap, 32, byte_of(0));
+    var fails = 0;
+    borrow mut entropy as &!ew in {
+        let ent = contents(ew);
+        let host = "127.0.0.1";
+        let path = "/mcp";
+        let ip = "127.0.0.1";
+        let roots = "";
+        let wait = 5000;
+        if bytes.equal(kind, "down") {
+            fails = fails + mark(io, mcp_http.detect(heap, net, clock, io, host, port, false, path, "", roots, ip, ent, wait) == 0 - 1, "a server that is not there cannot be detected");
+            let (code, tools) = mcp_http.list_tools(heap, net, clock, io, host, port, false, path, "", roots, ip, ent, wait, mcp.era_modern(), false);
+            fails = fails + mark(io, code == mcp_http.not_run(), "listing its tools says it was not reached");
+            buffer.drop(heap, tools);
+            let (c2, failed, text) = mcp_http.call_tool(heap, net, clock, io, host, port, false, path, "", roots, ip, ent, wait, mcp.era_auto(), "add", "{}");
+            borrow text as &tb in {
+                fails = fails + mark(io, c2 == mcp_http.not_run() && failed && has(buffer.bytes(tb), "could not be reached"), "calling a tool says the server could not be reached");
+            }
+            buffer.drop(heap, text);
+        } else if bytes.equal(kind, "silent") {
+            let (code, tools) = mcp_http.list_tools(heap, net, clock, io, host, port, false, path, "", roots, ip, ent, wait, mcp.era_modern(), false);
+            fails = fails + mark(io, code == mcp_http.no_answer(), "a server that answers 200 and nothing gives no answer");
+            buffer.drop(heap, tools);
+            let (c2, failed, text) = mcp_http.call_tool(heap, net, clock, io, host, port, false, path, "", roots, ip, ent, wait, mcp.era_modern(), "add", "{}");
+            fails = fails + mark(io, c2 == mcp_http.no_answer() && failed, "and a call to it is told so");
+            buffer.drop(heap, text);
+        } else if bytes.equal(kind, "badsid") {
+            let (c1, f1, t1) = mcp_http.call_tool(heap, net, clock, io, host, port, false, path, "", roots, ip, ent, wait, mcp.era_legacy(), "add", "{\"a\":1,\"b\":2}");
+            fails = fails + mark(io, c1 != mcp_http.ok() && f1, "a session id with a space is not written into a header, so the server refuses the call");
+            buffer.drop(heap, t1);
+        } else if bytes.equal(kind, "auth") {
+            let (c1, f1, t1) = mcp_http.call_tool(heap, net, clock, io, host, port, false, path, "", roots, ip, ent, wait, mcp.era_modern(), "add", "{\"a\":1,\"b\":2}");
+            borrow t1 as &t1b in {
+                fails = fails + mark(io, c1 == mcp_http.refused() && f1 && has(buffer.bytes(t1b), "HTTP status 401"), "without the bearer header the server's 401 is told as a status");
+            }
+            buffer.drop(heap, t1);
+            let bearer = "Authorization: Bearer tok\r\n";
+            let (c2, f2, t2) = mcp_http.call_tool(heap, net, clock, io, host, port, false, path, bearer, roots, ip, ent, wait, mcp.era_modern(), "add", "{\"a\":1,\"b\":2}");
+            borrow t2 as &t2b in {
+                fails = fails + mark(io, c2 == mcp_http.ok() && !f2 && bytes.equal(buffer.bytes(t2b), "3"), "with it the call is answered");
+            }
+            buffer.drop(heap, t2);
+        } else {
+            var want = mcp.era_modern();
+            if has(kind, "legacy") {
+                want = mcp.era_legacy();
+            }
+            fails = fails + mark(io, mcp_http.detect(heap, net, clock, io, host, port, false, path, "", roots, ip, ent, wait) == want, "the era of the server is found out");
+            let (code, tools) = mcp_http.list_tools(heap, net, clock, io, host, port, false, path, "", roots, ip, ent, wait, mcp.era_auto(), false);
+            fails = fails + mark(io, code == mcp_http.ok(), "the tools are listed");
+            borrow tools as &tb in {
+                fails = fails + mark(io, has(buffer.bytes(tb), "\"name\":\"add\""), "the first page is there");
+                fails = fails + mark(io, has(buffer.bytes(tb), "\"name\":\"echo\"") && has(buffer.bytes(tb), "\"name\":\"fail\""), "and the second, by its cursor");
+                fails = fails + mark(io, has(buffer.bytes(tb), "\"description\":\"Add two integers\""), "with the descriptions");
+            }
+            buffer.drop(heap, tools);
+            let (cro, only) = mcp_http.list_tools(heap, net, clock, io, host, port, false, path, "", roots, ip, ent, wait, mcp.era_auto(), true);
+            borrow only as &ob in {
+                fails = fails + mark(io, cro == mcp_http.ok() && has(buffer.bytes(ob), "\"name\":\"add\"") && has(buffer.bytes(ob), "\"name\":\"echo\""), "asked for the tools that only read: add and echo");
+                fails = fails + mark(io, !has(buffer.bytes(ob), "write_thing") && !has(buffer.bytes(ob), "\"name\":\"fail\""), "and not the one that writes, nor the one that says nothing about it");
+            }
+            buffer.drop(heap, only);
+            let (c1, f1, t1) = mcp_http.call_tool(heap, net, clock, io, host, port, false, path, "", roots, ip, ent, wait, want, "add", "{\"a\":2,\"b\":3}");
+            borrow t1 as &t1b in { fails = fails + mark(io, c1 == mcp_http.ok() && !f1 && bytes.equal(buffer.bytes(t1b), "5"), "add(2, 3) is 5"); }
+            buffer.drop(heap, t1);
+            let (c2, f2, t2) = mcp_http.call_tool(heap, net, clock, io, host, port, false, path, "", roots, ip, ent, wait, mcp.era_auto(), "echo", "{\"text\":\"say \\\"hi\\\" café\"}");
+            borrow t2 as &t2b in { fails = fails + mark(io, c2 == mcp_http.ok() && !f2 && bytes.equal(buffer.bytes(t2b), "say \"hi\" café"), "an argument with a quote and an accent comes back as it went (auto era)"); }
+            buffer.drop(heap, t2);
+            let (c3, f3, t3) = mcp_http.call_tool(heap, net, clock, io, host, port, false, path, "", roots, ip, ent, wait, want, "fail", "{}");
+            borrow t3 as &t3b in { fails = fails + mark(io, c3 == mcp_http.ok() && f3 && bytes.equal(buffer.bytes(t3b), "it always fails"), "a tool that fails is a result the model sees, marked as a failure"); }
+            buffer.drop(heap, t3);
+            let (c4, f4, t4) = mcp_http.call_tool(heap, net, clock, io, host, port, false, path, "", roots, ip, ent, wait, want, "nosuch", "{}");
+            borrow t4 as &t4b in { fails = fails + mark(io, c4 == mcp_http.answered_error() && f4 && has(buffer.bytes(t4b), "refused the call") && has(buffer.bytes(t4b), "Unknown tool: nosuch"), "an unknown tool is a protocol error, said as one"); }
+            buffer.drop(heap, t4);
+            let (c6, f6, t6) = mcp_http.call_tool(heap, net, clock, io, host, port, false, path, "", roots, ip, ent, wait, want, "bad name", "{}");
+            fails = fails + mark(io, c6 == mcp_http.unreadable() && f6, "a tool name that is not plain ASCII is not sent");
+            buffer.drop(heap, t6);
+            var other = mcp.era_legacy();
+            if want == mcp.era_legacy() {
+                other = mcp.era_modern();
+            }
+            let (c5, f5, t5) = mcp_http.call_tool(heap, net, clock, io, host, port, false, path, "", roots, ip, ent, wait, other, "add", "{\"a\":1,\"b\":1}");
+            fails = fails + mark(io, c5 != mcp_http.ok() && f5, "a call in the wrong era does not succeed");
+            buffer.drop(heap, t5);
+        }
+    }
+    unbox_slice(heap, entropy);
+    return fails;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec, tty } = split(world);
+    release(tty);
+    release(ffi);
+    release(signals);
+    release(exec);
+    release(fs);
+    var console = io;
+    var h = heap;
+    var rc = 1;
+    borrow args as &g in {
+        borrow net as &n in {
+            borrow clock as &c in {
+                borrow mut console as &!i in {
+                    borrow mut h as &!hh in {
+                        rc = run(hh, n, c, i, g);
+                    }
+                }
+            }
+        }
+    }
+    release(net);
+    release(clock);
+    release(console);
+    release(h);
+    release(args);
+    return rc;
+}

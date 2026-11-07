@@ -124,3 +124,69 @@ fn test_arrays_are_joined_and_names_prefixed[&h](heap: &!h Heap) -> [heap] int {
     same(heap, mcp.prefixed(heap, long, "mcp1_"), "[{\"name\":\"mcp1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"description\":\"\",\"schema\":\"{}\"}]");
     return 0;
 }
+
+fn lines[&h](heap: &!h Heap, body: &static [byte], want: &static [byte]) -> [heap] int {
+    same(heap, mcp.http_lines(heap, body), want);
+    return 0;
+}
+
+fn test_a_json_answer_is_one_line_even_when_pretty_printed[&h](heap: &!h Heap) -> [heap] int {
+    lines(heap, "{\"id\":1,\"result\":{}}", "{\"id\":1,\"result\":{}}\n");
+    lines(heap, "\n  {\"id\":1,\n  \"result\":{}}\r\n", "{\"id\":1,   \"result\":{}}  \n");
+    return 0;
+}
+
+fn test_an_event_stream_gives_one_line_per_event_with_data[&h](heap: &!h Heap) -> [heap] int {
+    lines(heap, "id: 0\ndata:\n\nevent: message\nid: 1\ndata: {\"id\":1,\"result\":{}}\n\n", "{\"id\":1,\"result\":{}}\n");
+    lines(heap, ": keep-alive\n\ndata: {\"method\":\"notifications/progress\"}\n\ndata: {\"id\":2,\"result\":{}}\n\n", "{\"method\":\"notifications/progress\"}\n{\"id\":2,\"result\":{}}\n");
+    lines(heap, "data: {\"id\":3,\r\ndata: \"result\":{}}\r\n\r\n", "{\"id\":3, \"result\":{}}\n");
+    lines(heap, "data:{\"id\":4}\n\n", "{\"id\":4}\n");
+    lines(heap, "retry: 1000\nid: 5\n\n", "");
+    return 0;
+}
+
+fn test_an_event_the_stream_ends_in_the_middle_of_is_still_read[&h](heap: &!h Heap) -> [heap] int {
+    lines(heap, "data: {\"id\":6,\"result\":{}}", "{\"id\":6,\"result\":{}}\n");
+    lines(heap, "data: {\"id\":6,\"result\":{}}\n", "{\"id\":6,\"result\":{}}\n");
+    lines(heap, "data: {\"id\":6,\ndata: \"result\":{}}", "{\"id\":6, \"result\":{}}\n");
+    lines(heap, "", "");
+    return 0;
+}
+
+fn test_the_answer_inside_a_stream_is_found_by_its_id[&h](heap: &!h Heap) -> [heap] int {
+    let l = mcp.http_lines(heap, "data: {\"method\":\"notifications/message\"}\n\ndata: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"x\":1}}\n\n");
+    borrow l as &lb in {
+        let (k7, l7) = mcp.find_response(heap, buffer.bytes(lb), 7);
+        test.assert_eq(k7, 1);
+        buffer.drop(heap, l7);
+        let (k8, l8) = mcp.find_response(heap, buffer.bytes(lb), 8);
+        test.assert_eq(k8, 0);
+        buffer.drop(heap, l8);
+    }
+    buffer.drop(heap, l);
+    return 0;
+}
+
+fn test_the_headers_of_a_post_carry_what_the_spec_asks_of_each_era[&h](heap: &!h Heap) -> [heap] int {
+    same(heap, mcp.http_headers(heap, "", "", "", "", ""), "Accept: application/json, text/event-stream\r\nContent-Type: application/json\r\n");
+    same(heap, mcp.http_headers(heap, "", "2026-07-28", "tools/call", "add", ""), "Accept: application/json, text/event-stream\r\nContent-Type: application/json\r\nMCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/call\r\nMcp-Name: add\r\n");
+    same(heap, mcp.http_headers(heap, "", "2025-11-25", "", "", "s-1"), "Accept: application/json, text/event-stream\r\nContent-Type: application/json\r\nMCP-Protocol-Version: 2025-11-25\r\nMcp-Session-Id: s-1\r\n");
+    same(heap, mcp.http_headers(heap, "Authorization: Bearer k\r\n", "2026-07-28", "tools/list", "", ""), "Accept: application/json, text/event-stream\r\nContent-Type: application/json\r\nMCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/list\r\nAuthorization: Bearer k\r\n");
+    return 0;
+}
+
+fn test_a_name_or_session_id_that_could_break_a_header_is_not_sent() -> [] int {
+    test.assert(mcp.plain_name("get_weather"));
+    test.assert(mcp.plain_name("a.b-c_d"));
+    test.assert(!mcp.plain_name(""));
+    test.assert(!mcp.plain_name("two words"));
+    test.assert(!mcp.plain_name("café"));
+    test.assert(!mcp.plain_name("x\r\nHost: evil"));
+    test.assert(!mcp.plain_name("=?base64?YWJj?="));
+    test.assert(mcp.visible_ascii("sess-abc123"));
+    test.assert(mcp.visible_ascii(""));
+    test.assert(!mcp.visible_ascii("a b"));
+    test.assert(!mcp.visible_ascii("a\r\nb"));
+    test.assert(!mcp.visible_ascii("é"));
+    return 0;
+}
