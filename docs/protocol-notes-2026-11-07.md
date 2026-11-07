@@ -1,0 +1,29 @@
+# Agent protocols as read on 2026-11-07
+
+Read by subagents from the official sources, **not from memory**. Parts were summarised by the fetch tool rather than quoted; each gap is named. Re-read the source before relying on a detail marked "unconfirmed".
+
+## AG-UI (spec 1.0, docs.ag-ui.com/spec/1.0/...)
+* Transport: `POST` to the agent's endpoint (no fixed path), `Content-Type: application/json`, `Accept: text/event-stream`. The answer is `200 text/event-stream`; a request rejected before the stream is an HTTP error with no stream; a failure after it is `RUN_ERROR` in the stream. The producer closes the body after the last terminal event. No `Last-Event-ID`: a retry is a new run with a new `runId`.
+* `RunAgentInput`: `threadId`, `runId`, `messages` required; `parentRunId`, `protocolVersion`, `state`, `tools`, `context`, `forwardedProps`, `resume` optional.
+* Each SSE event is `data: <one JSON object>` and a blank line, LF line ends only; consumers ignore `event:`, `id:`, `retry:` and tolerate `: ` comments.
+* 31 event types (wire names UPPER_SNAKE): `TEXT_MESSAGE_START/CONTENT/END/CHUNK`, `TOOL_CALL_START/ARGS/END/CHUNK/RESULT`, `STATE_SNAPSHOT/DELTA` (RFC 6902), `MESSAGES_SNAPSHOT`, `ACTIVITY_SNAPSHOT/DELTA`, `RAW`, `CUSTOM`, `RUN_STARTED/FINISHED/ERROR`, `STEP_STARTED/FINISHED`, `REASONING_*` (8), `SUBAGENT_STARTED/FINISHED/ERROR`. `THINKING_*` is retired. Absent optional fields are omitted, never null.
+* Order: the stream starts with `RUN_STARTED` (or `RUN_ERROR`); one run open at a time; every text/tool/step item opened is closed before `RUN_FINISHED`; a tool call is START, ARGS*, END; `TOOL_CALL_RESULT` is its own tool message; for frontend tools the producer sends no result and ends the run (optionally `outcome.pendingToolCallIds`).
+* Interrupts: `RUN_FINISHED` with `outcome {type: interrupt, interrupts: [...]}`; resumed by the next input's `resume`.
+* Optional protobuf binding (`application/vnd.ag-ui.event+proto`, 4-byte big-endian length frames); the SSE binding is mandatory.
+* **Unconfirmed:** HTTP status codes before the stream; the full `TokenUsage` and `Interrupt` schemas (the tail of schema.json was only summarised); the activity, reasoning, subagents, metadata pages; the draft spec; the repo's release version.
+
+## A2A (docs say 1.0.0, GitHub marks v1.0.1 of 2026-05-26 latest; spec text of 1.0.1 not read)
+* Three bindings, none mandatory: JSON-RPC, gRPC, HTTP+JSON. An HTTP-only agent declares and implements one.
+* Agent Card at `/.well-known/agent-card.json`; required: `name`, `description`, `supportedInterfaces` (each `url`, `protocolBinding` `JSONRPC|GRPC|HTTP+JSON`, `protocolVersion`), `version`, `capabilities`, `defaultInputModes`, `defaultOutputModes`, `skills` (each `id`, `name`, `description`, `tags`). Security schemes: one of api key, http auth, oauth2, openid connect, mTLS.
+* Methods (JSON-RPC names / REST): `SendMessage` `POST /message:send`, `SendStreamingMessage` `POST /message:stream`, `GetTask` `GET /tasks/{id}`, `ListTasks`, `CancelTask` `POST /tasks/{id}:cancel`, `SubscribeToTask` `POST /tasks/{id}:subscribe`, push-notification config methods, `GetExtendedAgentCard`.
+* Task states (ProtoJSON names): `TASK_STATE_SUBMITTED|WORKING|COMPLETED|FAILED|CANCELED|INPUT_REQUIRED|REJECTED|AUTH_REQUIRED`. Roles `ROLE_USER|ROLE_AGENT`. A `Part` is exactly one of `text`, `raw` (base64), `url`, `data`, with optional `mediaType`, `filename`; **no `kind` field in 1.0**. `StreamResponse` is exactly one of `task`, `message`, `statusUpdate`, `artifactUpdate`; no `final` flag; the stream closes when the task is terminal or interrupted.
+* Streaming: JSON-RPC wraps each `data:` in `{"jsonrpc":"2.0","id":N,"result":<StreamResponse>}`; REST sends the bare `StreamResponse`.
+* Headers: `A2A-Version: 1.0` on every request; REST `Content-Type: application/a2a+json` (v1.0.1 prefers it); `A2A-Extensions` lists extension URIs.
+* Errors: JSON-RPC -32001 TaskNotFound, -32002 TaskNotCancelable, -32003 PushNotificationNotSupported, -32004 UnsupportedOperation, -32005 ContentTypeNotSupported, -32006 InvalidAgentResponse, -32007 ExtendedAgentCardNotConfigured, -32008 ExtensionSupportRequired, -32009 VersionNotSupported (summarised, not verbatim).
+* **Unconfirmed:** section 7 (authentication) and 8.4 (card signing) not read; the exact JSON-RPC `SendMessage` result example; differences between 1.0.0 and 1.0.1; examples in the spec still show `A2A-Version: 0.3`.
+
+## A2UI (v1.0 "Current" on a2ui.org; the repo README still says "moving towards v1.0")
+* Declarative JSON, no code from the agent. Agent to client, one key per message: `createSurface`, `updateComponents` (flat list, one component with id `root`), `updateDataModel` (JSON Pointer `path`, `null` deletes), `deleteSurface`, `callRendererFunction`, `agentFunctionResponse`; every envelope has `"version":"1.0"`. Client to agent: `action` (`name`, `surfaceId`, `sourceComponentId`, `timestamp`, `context`), `error`, `rendererFunctionResponse`.
+* The client advertises `supportedCatalogIds`; the agent may only use components of a catalog both know; unknown components degrade, they do not crash. Basic catalog components: Text, Image, Icon, Video, AudioPlayer, Row, Column, List, Card, Tabs, Modal, Divider, Button, TextField, CheckBox, ChoicePicker, Slider, DateTimeInput. Data binding `{"@path": "/x"}`, functions `{"@call": ...}`, templates over a list path.
+* Carried in A2A as a `DataPart` with MIME `application/a2ui+json` (extension URI `https://a2ui.org/a2a-extension/a2ui/v1.0`); the spec names AG-UI as its standard transport binding **but the AG-UI event names and payload for it were not found**.
+* **Unconfirmed:** the second halves of the two main spec pages (summarised only), `callAgentFunction`, the remaining catalog functions, whether anything newer than v1.0 exists, and the SSE/WebSocket/REST transports (the site lists them both as supported and as "proposed").

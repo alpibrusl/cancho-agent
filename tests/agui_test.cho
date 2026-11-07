@@ -1,0 +1,101 @@
+import std.buffer;
+import std.bytes;
+import std.test;
+import agui;
+
+fn same[&h](heap: &!h Heap, b: buffer.Buffer, want: &static [byte]) -> [heap] int {
+    borrow b as &bb in {
+        test.assert(bytes.equal(buffer.bytes(bb), want));
+    }
+    buffer.drop(heap, b);
+    return 0;
+}
+
+fn test_the_events_are_written_as_the_spec_names_them[&h](heap: &!h Heap) -> [heap] int {
+    same(heap, agui.run_started(heap, "t1", "r1"), "data: {\"type\":\"RUN_STARTED\",\"threadId\":\"t1\",\"runId\":\"r1\",\"protocolVersion\":\"1.0\"}\n\n");
+    same(heap, agui.run_finished(heap, "t1", "r1"), "data: {\"type\":\"RUN_FINISHED\",\"threadId\":\"t1\",\"runId\":\"r1\"}\n\n");
+    same(heap, agui.run_error(heap, "boom", ""), "data: {\"type\":\"RUN_ERROR\",\"message\":\"boom\"}\n\n");
+    same(heap, agui.run_error(heap, "boom", "E1"), "data: {\"type\":\"RUN_ERROR\",\"message\":\"boom\",\"code\":\"E1\"}\n\n");
+    same(heap, agui.text_start(heap, "m1"), "data: {\"type\":\"TEXT_MESSAGE_START\",\"messageId\":\"m1\",\"role\":\"assistant\"}\n\n");
+    same(heap, agui.text_content(heap, "m1", "say \"hi\"\n"), "data: {\"type\":\"TEXT_MESSAGE_CONTENT\",\"messageId\":\"m1\",\"delta\":\"say \\\"hi\\\"\\n\"}\n\n");
+    same(heap, agui.text_end(heap, "m1"), "data: {\"type\":\"TEXT_MESSAGE_END\",\"messageId\":\"m1\"}\n\n");
+    same(heap, agui.tool_start(heap, "c1", "plan", ""), "data: {\"type\":\"TOOL_CALL_START\",\"toolCallId\":\"c1\",\"toolCallName\":\"plan\"}\n\n");
+    same(heap, agui.tool_start(heap, "c1", "plan", "m1"), "data: {\"type\":\"TOOL_CALL_START\",\"toolCallId\":\"c1\",\"toolCallName\":\"plan\",\"parentMessageId\":\"m1\"}\n\n");
+    same(heap, agui.tool_args(heap, "c1", "{\"a\":1}"), "data: {\"type\":\"TOOL_CALL_ARGS\",\"toolCallId\":\"c1\",\"delta\":\"{\\\"a\\\":1}\"}\n\n");
+    same(heap, agui.tool_end(heap, "c1"), "data: {\"type\":\"TOOL_CALL_END\",\"toolCallId\":\"c1\"}\n\n");
+    same(heap, agui.tool_result(heap, "m2", "c1", "ok"), "data: {\"type\":\"TOOL_CALL_RESULT\",\"messageId\":\"m2\",\"toolCallId\":\"c1\",\"content\":\"ok\",\"role\":\"tool\"}\n\n");
+    same(heap, agui.state_snapshot(heap, "{\"trip\":\"x\"}"), "data: {\"type\":\"STATE_SNAPSHOT\",\"snapshot\":{\"trip\":\"x\"}}\n\n");
+    same(heap, agui.custom(heap, "n", "null"), "data: {\"type\":\"CUSTOM\",\"name\":\"n\",\"value\":null}\n\n");
+    return 0;
+}
+
+fn verdict[&h](heap: &!h Heap, stream: &static [byte]) -> [heap] int {
+    return agui.check(heap, stream);
+}
+
+fn test_a_stream_that_follows_the_rules_is_accepted[&h](heap: &!h Heap) -> [heap] int {
+    test.assert_eq(verdict(heap, "data: {\"type\":\"RUN_STARTED\",\"threadId\":\"t\",\"runId\":\"r\"}\n\ndata: {\"type\":\"TEXT_MESSAGE_START\",\"messageId\":\"m\"}\n\ndata: {\"type\":\"TEXT_MESSAGE_CONTENT\",\"messageId\":\"m\",\"delta\":\"hi\"}\n\ndata: {\"type\":\"TEXT_MESSAGE_END\",\"messageId\":\"m\"}\n\ndata: {\"type\":\"RUN_FINISHED\",\"threadId\":\"t\",\"runId\":\"r\"}\n\n"), 0);
+    test.assert_eq(verdict(heap, "data: {\"type\":\"RUN_STARTED\"}\n\ndata: {\"type\":\"TOOL_CALL_START\",\"toolCallId\":\"c\",\"toolCallName\":\"plan\"}\n\ndata: {\"type\":\"TEXT_MESSAGE_START\",\"messageId\":\"c\"}\n\ndata: {\"type\":\"TOOL_CALL_ARGS\",\"toolCallId\":\"c\",\"delta\":\"{}\"}\n\ndata: {\"type\":\"TOOL_CALL_END\",\"toolCallId\":\"c\"}\n\ndata: {\"type\":\"TEXT_MESSAGE_END\",\"messageId\":\"c\"}\n\ndata: {\"type\":\"STATE_SNAPSHOT\",\"snapshot\":null}\n\ndata: {\"type\":\"RUN_FINISHED\"}\n\n"), 0);
+    test.assert_eq(verdict(heap, "data: {\"type\":\"RUN_ERROR\",\"message\":\"x\"}\n\n"), 0);
+    test.assert_eq(verdict(heap, ": hello\n\ndata: {\"type\":\"RUN_STARTED\"}\n\ndata: {\"type\":\"RUN_ERROR\",\"message\":\"x\"}\n\ndata: {\"type\":\"RUN_STARTED\"}\n\ndata: {\"type\":\"RUN_FINISHED\"}\n\n"), 0);
+    return 0;
+}
+
+fn test_each_rule_is_found_when_it_is_broken[&h](heap: &!h Heap) -> [heap] int {
+    test.assert_eq(verdict(heap, "data: {\"type\":\"TEXT_MESSAGE_START\",\"messageId\":\"m\"}\n\n"), 1);
+    test.assert_eq(verdict(heap, "data: {\"type\":\"RUN_STARTED\"}\n\ndata: {\"type\":\"RUN_STARTED\"}\n\n"), 2);
+    test.assert_eq(verdict(heap, "data: {\"type\":\"RUN_STARTED\"}\n\ndata: {\"type\":\"TEXT_MESSAGE_START\",\"messageId\":\"m\"}\n\ndata: {\"type\":\"TEXT_MESSAGE_START\",\"messageId\":\"m\"}\n\n"), 3);
+    test.assert_eq(verdict(heap, "data: {\"type\":\"RUN_STARTED\"}\n\ndata: {\"type\":\"TOOL_CALL_START\",\"toolCallId\":\"c\",\"toolCallName\":\"p\"}\n\ndata: {\"type\":\"TOOL_CALL_START\",\"toolCallId\":\"c\",\"toolCallName\":\"p\"}\n\n"), 3);
+    test.assert_eq(verdict(heap, "data: {\"type\":\"RUN_STARTED\"}\n\ndata: {\"type\":\"TEXT_MESSAGE_CONTENT\",\"messageId\":\"m\",\"delta\":\"x\"}\n\n"), 4);
+    test.assert_eq(verdict(heap, "data: {\"type\":\"RUN_STARTED\"}\n\ndata: {\"type\":\"TOOL_CALL_END\",\"toolCallId\":\"c\"}\n\n"), 4);
+    test.assert_eq(verdict(heap, "data: {\"type\":\"RUN_STARTED\"}\n\ndata: {\"type\":\"TEXT_MESSAGE_START\",\"messageId\":\"m\"}\n\ndata: {\"type\":\"TEXT_MESSAGE_END\",\"messageId\":\"m\"}\n\ndata: {\"type\":\"TEXT_MESSAGE_END\",\"messageId\":\"m\"}\n\n"), 4);
+    test.assert_eq(verdict(heap, "data: {\"type\":\"RUN_STARTED\"}\n\ndata: {\"type\":\"TEXT_MESSAGE_START\",\"messageId\":\"m\"}\n\ndata: {\"type\":\"RUN_FINISHED\"}\n\n"), 5);
+    test.assert_eq(verdict(heap, "data: {\"type\":\"RUN_STARTED\"}\n\ndata: {\"type\":\"RUN_FINISHED\"}\n\ndata: {\"type\":\"TEXT_MESSAGE_START\",\"messageId\":\"m\"}\n\n"), 6);
+    test.assert_eq(verdict(heap, "data: {\"type\":\"RUN_ERROR\",\"message\":\"x\"}\n\ndata: {\"type\":\"RUN_FINISHED\"}\n\n"), 6);
+    test.assert_eq(verdict(heap, "data: {\"type\":\"RUN_ERROR\",\"message\":\"x\"}\n\ndata: {\"type\":\"RUN_ERROR\",\"message\":\"y\"}\n\n"), 6);
+    test.assert_eq(verdict(heap, "data: {\"type\":\"RUN_STARTED\"}\n\ndata: not json\n\n"), 7);
+    test.assert_eq(verdict(heap, "data: {\"type\":\"RUN_STARTED\"}\n\ndata: {\"nope\":1}\n\n"), 7);
+    test.assert_eq(verdict(heap, "data: {\"type\":\"RUN_STARTED\"}\n\ndata: {\"type\":\"TEXT_MESSAGE_START\",\"messageId\":\"m\"}\n\n"), 8);
+    test.assert_eq(verdict(heap, ""), 8);
+    return 0;
+}
+
+fn test_the_events_this_module_writes_pass_its_own_check[&h](heap: &!h Heap) -> [heap] int {
+    var s = agui.run_started(heap, "t", "r");
+    s = buffer.append(heap, s, "");
+    var parts = buffer.empty(heap, 64);
+    parts = buffer.append(heap, parts, "");
+    borrow s as &sb in {
+        parts = buffer.append(heap, parts, buffer.bytes(sb));
+    }
+    buffer.drop(heap, s);
+    let a = agui.text_start(heap, "m");
+    let b = agui.text_content(heap, "m", "hi");
+    let c = agui.text_end(heap, "m");
+    let d = agui.tool_start(heap, "c", "plan", "m");
+    let e = agui.tool_args(heap, "c", "{}");
+    let f = agui.tool_end(heap, "c");
+    let g = agui.tool_result(heap, "m2", "c", "ok");
+    let h2 = agui.run_finished(heap, "t", "r");
+    borrow a as &ab in { parts = buffer.append(heap, parts, buffer.bytes(ab)); }
+    borrow b as &bb in { parts = buffer.append(heap, parts, buffer.bytes(bb)); }
+    borrow c as &cb in { parts = buffer.append(heap, parts, buffer.bytes(cb)); }
+    borrow d as &db in { parts = buffer.append(heap, parts, buffer.bytes(db)); }
+    borrow e as &eb in { parts = buffer.append(heap, parts, buffer.bytes(eb)); }
+    borrow f as &fb in { parts = buffer.append(heap, parts, buffer.bytes(fb)); }
+    borrow g as &gb in { parts = buffer.append(heap, parts, buffer.bytes(gb)); }
+    borrow h2 as &hb in { parts = buffer.append(heap, parts, buffer.bytes(hb)); }
+    buffer.drop(heap, a);
+    buffer.drop(heap, b);
+    buffer.drop(heap, c);
+    buffer.drop(heap, d);
+    buffer.drop(heap, e);
+    buffer.drop(heap, f);
+    buffer.drop(heap, g);
+    buffer.drop(heap, h2);
+    borrow parts as &pb in {
+        test.assert_eq(agui.check(heap, buffer.bytes(pb)), 0);
+    }
+    buffer.drop(heap, parts);
+    return 0;
+}

@@ -1,0 +1,333 @@
+edition 7;
+
+module agui;
+
+import std.buffer;
+import std.bytes;
+import std.json;
+import mcp;
+import msg;
+
+// AG-UI, the event stream a front end reads from an agent (cancho-agent, docs/design.md section 8). Pure: the events a server writes, as Server-Sent Events frames, and a checker
+// that reads a stream back and says which of the protocol's ordering rules it breaks. Written from the 1.0 specification as read on 2026-11-07 (docs/protocol-notes-2026-11-07.md, which
+// names what was not confirmed), not from memory.
+//
+// A frame is `data: <one JSON object>` and a blank line, LF line ends only. Optional fields that are absent are left out, never null. The wire names of the types are the UPPER_SNAKE ones.
+// Only the events a backend assistant needs are built (the run, text messages, tool calls with their result, a state snapshot, a custom event); the other types are read by `check` as
+// events of a run and not otherwise judged.
+
+fn frame[&h](heap: &!h Heap, w: json.Writer) -> [heap] buffer.Buffer {
+    let o = json.end_object(heap, w);
+    let j = json.finish(o);
+    var b = buffer.append(heap, buffer.empty(heap, 64), "data: ");
+    borrow j as &jb in {
+        b = buffer.append(heap, b, buffer.bytes(jb));
+    }
+    buffer.drop(heap, j);
+    return buffer.append(heap, b, "\n\n");
+}
+
+fn ev[&h, &t](heap: &!h Heap, kind: &t [byte]) -> [heap] json.Writer {
+    var w = json.begin_object(heap, json.writer(heap, 128));
+    w = json.put_key(heap, w, "type");
+    return json.put_string(heap, w, kind);
+}
+
+fn str[&h, &k, &v](heap: &!h Heap, w: json.Writer, key: &k [byte], value: &v [byte]) -> [heap] json.Writer {
+    let o = json.put_key(heap, w, key);
+    return json.put_string(heap, o, value);
+}
+
+fn raw[&h, &k, &v](heap: &!h Heap, w: json.Writer, key: &k [byte], fragment: &v [byte]) -> [heap] json.Writer {
+    let o = json.put_key(heap, w, key);
+    return json.put_fragment(heap, o, fragment);
+}
+
+pub fn protocol_version() -> [] &static [byte] {
+    return "1.0";
+}
+
+pub fn run_started[&h, &t, &r](heap: &!h Heap, thread: &t [byte], run: &r [byte]) -> [heap] buffer.Buffer {
+    var w = ev(heap, "RUN_STARTED");
+    w = str(heap, w, "threadId", thread);
+    w = str(heap, w, "runId", run);
+    w = str(heap, w, "protocolVersion", protocol_version());
+    return frame(heap, w);
+}
+
+pub fn run_finished[&h, &t, &r](heap: &!h Heap, thread: &t [byte], run: &r [byte]) -> [heap] buffer.Buffer {
+    var w = ev(heap, "RUN_FINISHED");
+    w = str(heap, w, "threadId", thread);
+    w = str(heap, w, "runId", run);
+    return frame(heap, w);
+}
+
+// `code` may be empty (then it is left out).
+pub fn run_error[&h, &m, &c](heap: &!h Heap, message: &m [byte], code: &c [byte]) -> [heap] buffer.Buffer {
+    var w = ev(heap, "RUN_ERROR");
+    w = str(heap, w, "message", message);
+    if len(code) > 0 {
+        w = str(heap, w, "code", code);
+    }
+    return frame(heap, w);
+}
+
+pub fn text_start[&h, &i](heap: &!h Heap, id: &i [byte]) -> [heap] buffer.Buffer {
+    var w = ev(heap, "TEXT_MESSAGE_START");
+    w = str(heap, w, "messageId", id);
+    w = str(heap, w, "role", "assistant");
+    return frame(heap, w);
+}
+
+pub fn text_content[&h, &i, &d](heap: &!h Heap, id: &i [byte], delta: &d [byte]) -> [heap] buffer.Buffer {
+    var w = ev(heap, "TEXT_MESSAGE_CONTENT");
+    w = str(heap, w, "messageId", id);
+    w = str(heap, w, "delta", delta);
+    return frame(heap, w);
+}
+
+pub fn text_end[&h, &i](heap: &!h Heap, id: &i [byte]) -> [heap] buffer.Buffer {
+    var w = ev(heap, "TEXT_MESSAGE_END");
+    w = str(heap, w, "messageId", id);
+    return frame(heap, w);
+}
+
+// `parent` (the message the call belongs to) may be empty.
+pub fn tool_start[&h, &i, &n, &p](heap: &!h Heap, id: &i [byte], name: &n [byte], parent: &p [byte]) -> [heap] buffer.Buffer {
+    var w = ev(heap, "TOOL_CALL_START");
+    w = str(heap, w, "toolCallId", id);
+    w = str(heap, w, "toolCallName", name);
+    if len(parent) > 0 {
+        w = str(heap, w, "parentMessageId", parent);
+    }
+    return frame(heap, w);
+}
+
+pub fn tool_args[&h, &i, &d](heap: &!h Heap, id: &i [byte], delta: &d [byte]) -> [heap] buffer.Buffer {
+    var w = ev(heap, "TOOL_CALL_ARGS");
+    w = str(heap, w, "toolCallId", id);
+    w = str(heap, w, "delta", delta);
+    return frame(heap, w);
+}
+
+pub fn tool_end[&h, &i](heap: &!h Heap, id: &i [byte]) -> [heap] buffer.Buffer {
+    var w = ev(heap, "TOOL_CALL_END");
+    w = str(heap, w, "toolCallId", id);
+    return frame(heap, w);
+}
+
+// The result is its own tool message, with its own `message_id`.
+pub fn tool_result[&h, &m, &i, &c](heap: &!h Heap, message_id: &m [byte], id: &i [byte], content: &c [byte]) -> [heap] buffer.Buffer {
+    var w = ev(heap, "TOOL_CALL_RESULT");
+    w = str(heap, w, "messageId", message_id);
+    w = str(heap, w, "toolCallId", id);
+    w = str(heap, w, "content", content);
+    w = str(heap, w, "role", "tool");
+    return frame(heap, w);
+}
+
+// `snapshot` is JSON text (any value).
+pub fn state_snapshot[&h, &s](heap: &!h Heap, snapshot: &s [byte]) -> [heap] buffer.Buffer {
+    var w = ev(heap, "STATE_SNAPSHOT");
+    w = raw(heap, w, "snapshot", snapshot);
+    return frame(heap, w);
+}
+
+// `value` is JSON text (any value, null allowed).
+pub fn custom[&h, &n, &v](heap: &!h Heap, name: &n [byte], value: &v [byte]) -> [heap] buffer.Buffer {
+    var w = ev(heap, "CUSTOM");
+    w = str(heap, w, "name", name);
+    w = raw(heap, w, "value", value);
+    return frame(heap, w);
+}
+
+// ---- reading a stream back --------------------------------------------------------------------------------------------------------------------------------------
+
+// Codes of `check`: 0 the stream follows the rules, 1 it does not begin with RUN_STARTED or RUN_ERROR, 2 a run starts while another is open, 3 an item (a text message or a tool call)
+// is opened that is already open, 4 content or an end for an item that is not open, 5 a run finishes with an item still open, 6 an event after the run was closed, 7 an event that is not
+// a JSON object with a string `type`, 8 the stream ends with no RUN_FINISHED or RUN_ERROR (a truncated run, which a consumer must not take for success).
+
+pub fn ok() -> [] int {
+    return 0;
+}
+
+// Is `"\n" + key + "\n"` in `open`?
+fn is_open[&o, &k](open: &o [byte], key: &k [byte]) -> [] bool {
+    var i = 0;
+    while i + len(key) + 2 <= len(open) {
+        if int_of(open[i]) == 10 && bytes.equal(open[i + 1..i + 1 + len(key)], key) && int_of(open[i + 1 + len(key)]) == 10 {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn add[&h, &k](heap: &!h Heap, open: buffer.Buffer, key: &k [byte]) -> [heap] buffer.Buffer {
+    var b = buffer.append(heap, open, key);
+    return buffer.push(heap, b, byte_of(10));
+}
+
+fn remove[&h, &k](heap: &!h Heap, open: buffer.Buffer, key: &k [byte]) -> [heap] buffer.Buffer {
+    var out = buffer.append(heap, buffer.empty(heap, 16), "\n");
+    var at = 0 - 1;
+    borrow open as &ob in {
+        var i = 0;
+        while i + len(key) + 2 <= len(buffer.bytes(ob)) && at < 0 {
+            if int_of(buffer.bytes(ob)[i]) == 10 && bytes.equal(buffer.bytes(ob)[i + 1..i + 1 + len(key)], key) && int_of(buffer.bytes(ob)[i + 1 + len(key)]) == 10 {
+                at = i;
+            }
+            i = i + 1;
+        }
+        let whole = buffer.bytes(ob);
+        if at < 0 {
+            buffer.drop(heap, out);
+            out = buffer.append(heap, buffer.empty(heap, len(whole) + 1), whole);
+        } else {
+            out = buffer.append(heap, out, whole[1..at + 1]);
+            out = buffer.append(heap, out, whole[at + len(key) + 2..len(whole)]);
+        }
+    }
+    buffer.drop(heap, open);
+    return out;
+}
+
+// The key an event opens or closes: `t:<messageId>` for a text message, `c:<toolCallId>` for a tool call.
+fn item_key[&h, &s, &t](heap: &!h Heap, src: &s [byte], tape: &t [int], prefix: &static [byte], field: &static [byte]) -> [heap] buffer.Buffer {
+    var k = buffer.append(heap, buffer.empty(heap, 32), prefix);
+    let id = msg.string_of(heap, src, tape, json.get(src, tape, 0, field));
+    borrow id as &ib in {
+        k = buffer.append(heap, k, buffer.bytes(ib));
+    }
+    buffer.drop(heap, id);
+    return k;
+}
+
+// One event against the state of the stream: (the violation code or 0, the new state, the open items). State: 0 nothing yet, 1 a run is open, 2 the run finished (an error may still
+// follow, or a new run), 3 the run ended in an error (only a new run may follow).
+fn step[&h, &s, &t, &k](heap: &!h Heap, state: int, open: buffer.Buffer, src: &s [byte], tape: &t [int], kind: &k [byte]) -> [heap] (int, int, buffer.Buffer) {
+    var o = open;
+    if bytes.equal(kind, "RUN_STARTED") {
+        if state == 1 {
+            return (2, state, o);
+        }
+        buffer.drop(heap, o);
+        return (0, 1, buffer.append(heap, buffer.empty(heap, 16), "\n"));
+    }
+    if bytes.equal(kind, "RUN_ERROR") {
+        if state == 3 {
+            return (6, state, o);
+        }
+        buffer.drop(heap, o);
+        return (0, 3, buffer.append(heap, buffer.empty(heap, 16), "\n"));
+    }
+    if state == 0 {
+        return (1, state, o);
+    }
+    if state == 2 || state == 3 {
+        return (6, state, o);
+    }
+    if bytes.equal(kind, "RUN_FINISHED") {
+        var empty = true;
+        borrow o as &ob in {
+            empty = len(buffer.bytes(ob)) <= 1;
+        }
+        if !empty {
+            return (5, state, o);
+        }
+        return (0, 2, o);
+    }
+    var code = 0;
+    if bytes.equal(kind, "TEXT_MESSAGE_START") || bytes.equal(kind, "TEXT_MESSAGE_CONTENT") || bytes.equal(kind, "TEXT_MESSAGE_END") {
+        let key = item_key(heap, src, tape, "t:", "messageId");
+        borrow key as &kb in {
+            var present = false;
+            borrow o as &ob in {
+                present = is_open(buffer.bytes(ob), buffer.bytes(kb));
+            }
+            if bytes.equal(kind, "TEXT_MESSAGE_START") {
+                if present {
+                    code = 3;
+                } else {
+                    o = add(heap, o, buffer.bytes(kb));
+                }
+            } else if !present {
+                code = 4;
+            } else if bytes.equal(kind, "TEXT_MESSAGE_END") {
+                o = remove(heap, o, buffer.bytes(kb));
+            }
+        }
+        buffer.drop(heap, key);
+    } else if bytes.equal(kind, "TOOL_CALL_START") || bytes.equal(kind, "TOOL_CALL_ARGS") || bytes.equal(kind, "TOOL_CALL_END") {
+        let key = item_key(heap, src, tape, "c:", "toolCallId");
+        borrow key as &kb in {
+            var present = false;
+            borrow o as &ob in {
+                present = is_open(buffer.bytes(ob), buffer.bytes(kb));
+            }
+            if bytes.equal(kind, "TOOL_CALL_START") {
+                if present {
+                    code = 3;
+                } else {
+                    o = add(heap, o, buffer.bytes(kb));
+                }
+            } else if !present {
+                code = 4;
+            } else if bytes.equal(kind, "TOOL_CALL_END") {
+                o = remove(heap, o, buffer.bytes(kb));
+            }
+        }
+        buffer.drop(heap, key);
+    }
+    return (code, state, o);
+}
+
+// Read `stream` (SSE text, as `mcp.http_lines` reads it) and say which rule it breaks first: 0 if none.
+pub fn check[&h, &s](heap: &!h Heap, stream: &s [byte]) -> [heap] int {
+    let lines = mcp.http_lines(heap, stream);
+    var state = 0;
+    var open = buffer.append(heap, buffer.empty(heap, 16), "\n");
+    var code = 0;
+    borrow lines as &lb in {
+        let all = buffer.bytes(lb);
+        var start = 0;
+        var i = 0;
+        while i < len(all) && code == 0 {
+            if int_of(all[i]) == 10 {
+                let line = all[start..i];
+                let tape = box_slice(heap, 3 * len(line) + 3, 0);
+                var tape_w = tape;
+                borrow mut tape_w as &!tw in {
+                    let tp = contents(tw);
+                    var kind_ok = false;
+                    if json.parse(line, tp) >= 0 && json.is_object(tp, 0) {
+                        let tn = json.get(line, tp, 0, "type");
+                        if tn >= 0 && json.is_string(tp, tn) {
+                            kind_ok = true;
+                            let kind = msg.string_of(heap, line, tp, tn);
+                            borrow kind as &kb in {
+                                let (c, ns, no) = step(heap, state, open, line, tp, buffer.bytes(kb));
+                                code = c;
+                                state = ns;
+                                open = no;
+                            }
+                            buffer.drop(heap, kind);
+                        }
+                    }
+                    if !kind_ok {
+                        code = 7;
+                    }
+                }
+                unbox_slice(heap, tape_w);
+                start = i + 1;
+            }
+            i = i + 1;
+        }
+    }
+    buffer.drop(heap, lines);
+    buffer.drop(heap, open);
+    if code == 0 && state != 2 && state != 3 {
+        return 8;
+    }
+    return code;
+}
